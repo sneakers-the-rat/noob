@@ -123,11 +123,6 @@ def test_zmq_out_of_order():
             runner._mark_pseudo_nodes_done(epoch)
             runner.command.process(epoch, validated)
 
-        # brief delay to ensure all ProcessMsg arrive at NodeRunners before processing starts
-        # this allows epochs to be processed in numerical order (via sorted scheduler)
-        import time
-        time.sleep(0.1)
-
         # wait until all the epochs have completed
         for epoch in range(5):
             runner.tube.scheduler.await_epoch(epoch)

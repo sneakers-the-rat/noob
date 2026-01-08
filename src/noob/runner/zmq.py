@@ -27,7 +27,7 @@ import os
 import signal
 import threading
 import traceback
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from itertools import count
@@ -297,7 +297,6 @@ class NodeRunner(EventloopMixin):
         self._status_lock = mp.RLock()
         self._to_process = 0
         self._process_inputs: dict[int, dict] = {}
-        self._epochs_to_process: deque[int] = deque()
 
     @property
     def outbox_address(self) -> str:
@@ -360,8 +359,9 @@ class NodeRunner(EventloopMixin):
                 )
                 value = runner._node.process(*args, **kwargs)
                 events = runner.store.add_value(runner._node.signals, value, runner._node.id, epoch)
-                # Epochs are now added by on_process() when ProcessMsg arrives,
-                # so we don't need to add new epochs here
+                # Add the next epoch - source nodes drive the epoch clock
+                new_epoch = runner.scheduler.add_epoch()
+                runner._mark_pseudo_nodes_done(new_epoch)
 
                 # node runners should not report epoch endings
                 events = [e for e in events if e["node_id"] != "meta"]
@@ -384,22 +384,15 @@ class NodeRunner(EventloopMixin):
             if not self._freerun.is_set():
                 if self._to_process == 0:
                     self._process_one.wait()
-                # Brief pause to allow additional ProcessMsg to arrive
-                # This helps ensure epochs are processed in numerical order
-                # when multiple ProcessMsg arrive in a burst
-                import time
-                time.sleep(0.01)
                 self._to_process -= 1
                 if self._to_process == 0:
                     self._process_one.clear()
 
             # Wait for the next epoch's dependencies to be ready.
-            # The scheduler returns the lowest ready epoch when epoch=None.
+            # Source nodes drive the epoch clock - they emit events with sequential
+            # epochs based on their iteration count, regardless of ProcessMsg order.
             ready = self.scheduler.await_node(self.spec.id)
             epoch = ready["epoch"]
-            # Remove this epoch from the queue if present
-            if epoch in self._epochs_to_process:
-                self._epochs_to_process.remove(epoch)
             edges = self._node.edges
             inputs: dict = {}
 
@@ -483,8 +476,9 @@ class NodeRunner(EventloopMixin):
         self._node = Node.from_specification(self.spec, self.input_collection)
         self._node.init()
         self.scheduler = Scheduler(nodes={self.spec.id: self.spec}, edges=self._node.edges)
-        # Epochs are now added by on_process() when ProcessMsg arrives,
-        # so we don't add an initial epoch here
+        # Add initial epoch - source nodes drive the epoch clock
+        epoch = self.scheduler.add_epoch()
+        self._mark_pseudo_nodes_done(epoch)
 
     def _mark_pseudo_nodes_done(self, epoch: int) -> None:
         """Mark pseudo-nodes as done in the local scheduler.
@@ -612,19 +606,13 @@ class NodeRunner(EventloopMixin):
         """
         Process a single graph iteration.
 
-        The epoch from ProcessMsg determines which iteration this is for,
-        allowing inputs to be matched to their corresponding events even
-        when messages arrive out of order due to network latency.
+        The epoch from ProcessMsg is used to tag the input so it can be matched
+        with the correct events when the node processes. Source nodes drive
+        the epoch clock - they emit events with sequential epochs based on
+        their iteration count, regardless of ProcessMsg arrival order.
         """
-        epoch = msg.epoch
-        self._process_inputs[epoch] = msg.value if msg.value else {}
-        self._epochs_to_process.append(epoch)
-
-        # Add epoch to local scheduler if not already there
-        if epoch not in self.scheduler._epochs and epoch not in self.scheduler._epoch_log:
-            self.scheduler.add_epoch(epoch)
-            self._mark_pseudo_nodes_done(epoch)
-
+        # Store input keyed by ProcessMsg's epoch for later lookup
+        self._process_inputs[msg.epoch] = msg.value if msg.value else {}
         self._to_process += 1
         self._process_one.set()
 
