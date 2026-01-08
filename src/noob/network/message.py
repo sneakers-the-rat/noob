@@ -110,7 +110,8 @@ class ProcessMsg(Message):
     """Process a single iteration of the graph"""
 
     type_: Literal[MessageType.process] = Field(MessageType.process, alias="type")
-    value: None = None
+    epoch: int
+    value: dict | None = None
 
 
 class StartMsg(Message):

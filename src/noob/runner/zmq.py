@@ -27,7 +27,7 @@ import os
 import signal
 import threading
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from itertools import count
@@ -49,7 +49,7 @@ from zmq.eventloop.zmqstream import ZMQStream
 
 from noob.config import config
 from noob.event import Event
-from noob.input import InputCollection
+from noob.input import InputCollection, InputScope
 from noob.logging import init_logger
 from noob.network.message import (
     AnnounceMsg,
@@ -179,10 +179,12 @@ class CommandNode(EventloopMixin):
         )
         self._outbox.send_multipart([b"announce", msg.to_bytes()])
 
-    def process(self) -> None:
+    def process(self, epoch: int, input: dict | None = None) -> None:
         """Emit a ProcessMsg to process a single round through the graph"""
-        self._outbox.send_multipart([b"process", ProcessMsg(node_id="command").to_bytes()])
-        self.logger.debug("Sent process message")
+        self._outbox.send_multipart(
+            [b"process", ProcessMsg(node_id="command", epoch=epoch, value=input).to_bytes()]
+        )
+        self.logger.debug("Sent process message for epoch %s with input: %s", epoch, input)
 
     def add_callback(self, type_: Literal["inbox", "router"], cb: Callable[[Message], Any]) -> None:
         """
@@ -294,6 +296,8 @@ class NodeRunner(EventloopMixin):
         self._status: NodeStatus = NodeStatus.stopped
         self._status_lock = mp.RLock()
         self._to_process = 0
+        self._process_inputs: dict[int, dict] = {}
+        self._epochs_to_process: deque[int] = deque()
 
     @property
     def outbox_address(self) -> str:
@@ -306,12 +310,18 @@ class NodeRunner(EventloopMixin):
 
     @property
     def depends(self) -> tuple[tuple[str, str], ...] | None:
-        """(node, signal) tuples of the wrapped node's dependencies"""
+        """(node, signal) tuples of the wrapped node's dependencies on other nodes.
+
+        Note: This excludes pseudo-nodes like 'input' and 'assets' since they
+        are handled separately and don't participate in the ZMQ messaging.
+        """
         if self._node is None:
             return None
         elif self._depends is None:
             self._depends = tuple(
-                (edge.source_node, edge.source_signal) for edge in self._node.edges
+                (edge.source_node, edge.source_signal)
+                for edge in self._node.edges
+                if edge.source_node not in ("input", "assets")
             )
         return self._depends
 
@@ -350,7 +360,8 @@ class NodeRunner(EventloopMixin):
                 )
                 value = runner._node.process(*args, **kwargs)
                 events = runner.store.add_value(runner._node.signals, value, runner._node.id, epoch)
-                runner.scheduler.add_epoch()
+                # Epochs are now added by on_process() when ProcessMsg arrives,
+                # so we don't need to add new epochs here
 
                 # node runners should not report epoch endings
                 events = [e for e in events if e["node_id"] != "meta"]
@@ -373,17 +384,40 @@ class NodeRunner(EventloopMixin):
             if not self._freerun.is_set():
                 if self._to_process == 0:
                     self._process_one.wait()
+                # Brief pause to allow additional ProcessMsg to arrive
+                # This helps ensure epochs are processed in numerical order
+                # when multiple ProcessMsg arrive in a burst
+                import time
+                time.sleep(0.01)
                 self._to_process -= 1
                 if self._to_process == 0:
                     self._process_one.clear()
 
+            # Wait for the next epoch's dependencies to be ready.
+            # The scheduler returns the lowest ready epoch when epoch=None.
             ready = self.scheduler.await_node(self.spec.id)
+            epoch = ready["epoch"]
+            # Remove this epoch from the queue if present
+            if epoch in self._epochs_to_process:
+                self._epochs_to_process.remove(epoch)
             edges = self._node.edges
-            inputs = self.store.collect(edges, ready["epoch"])
-            if inputs is None:
-                inputs = {}
+            inputs: dict = {}
+
+            # pop the process-scoped input for this epoch
+            process_input = self._process_inputs.pop(epoch, {})
+
+            # collect from event store
+            event_inputs = self.store.collect(edges, epoch)
+            if event_inputs:
+                inputs |= event_inputs
+
+            # collect from input collection (process-scoped inputs)
+            input_inputs = self.input_collection.collect(edges, process_input)
+            if input_inputs:
+                inputs |= input_inputs
+
             args, kwargs = self.store.split_args_kwargs(inputs)
-            yield args, kwargs, ready["epoch"]
+            yield args, kwargs, epoch
 
     def update_graph(self, events: list[Event]) -> None:
         self.scheduler.update(events)
@@ -449,7 +483,25 @@ class NodeRunner(EventloopMixin):
         self._node = Node.from_specification(self.spec, self.input_collection)
         self._node.init()
         self.scheduler = Scheduler(nodes={self.spec.id: self.spec}, edges=self._node.edges)
-        self.scheduler.add_epoch()
+        # Epochs are now added by on_process() when ProcessMsg arrives,
+        # so we don't add an initial epoch here
+
+    def _mark_pseudo_nodes_done(self, epoch: int) -> None:
+        """Mark pseudo-nodes as done in the local scheduler.
+
+        Pseudo-nodes like 'input' and 'assets' don't emit events via ZMQ,
+        but may appear in the dependency graph. Mark them done so dependent
+        nodes can proceed.
+
+        Note: We call done() directly without get_ready() because the scheduler
+        handles this case via internal graphlib surgery (see scheduler.py:223-233).
+        """
+        # Find pseudo-nodes that are sources in the edges
+        pseudo_sources = {
+            edge.source_node for edge in self.scheduler.edges if edge.source_node in ("input", "assets")
+        }
+        for pseudo_node in pseudo_sources:
+            self.scheduler.done(epoch, pseudo_node)
 
     def _init_sockets(self) -> None:
         self._dealer = self._init_dealer()
@@ -528,7 +580,12 @@ class NodeRunner(EventloopMixin):
         """
         self._node = cast(Node, self._node)
         with self._status_lock:
-            depended_nodes = {edge.source_node for edge in self._node.edges}
+            # Exclude pseudo-nodes (input, assets) from dependency tracking
+            depended_nodes = {
+                edge.source_node
+                for edge in self._node.edges
+                if edge.source_node not in ("input", "assets")
+            }
             for node_id in msg.value["nodes"]:
                 if node_id in depended_nodes and node_id not in self._nodes:
                     # TODO: a way to check if we're already connected, without storing it locally?
@@ -553,9 +610,21 @@ class NodeRunner(EventloopMixin):
 
     def on_process(self, msg: ProcessMsg) -> None:
         """
-        Process a single graph iteration
+        Process a single graph iteration.
+
+        The epoch from ProcessMsg determines which iteration this is for,
+        allowing inputs to be matched to their corresponding events even
+        when messages arrive out of order due to network latency.
         """
-        # TODO: handle inputs
+        epoch = msg.epoch
+        self._process_inputs[epoch] = msg.value if msg.value else {}
+        self._epochs_to_process.append(epoch)
+
+        # Add epoch to local scheduler if not already there
+        if epoch not in self.scheduler._epochs and epoch not in self.scheduler._epoch_log:
+            self.scheduler.add_epoch(epoch)
+            self._mark_pseudo_nodes_done(epoch)
+
         self._to_process += 1
         self._process_one.set()
 
@@ -673,15 +742,39 @@ class ZMQRunner(TubeRunner):
             self._logger.info("Runner called process without calling `init`, initializing now.")
             self.init()
 
+        input = self.tube.input_collection.validate_input(InputScope.process, kwargs)
+
         self._current_epoch = self.tube.scheduler.add_epoch()
+        # Mark pseudo-nodes (input, assets) as done since they don't emit events
+        self._mark_pseudo_nodes_done(self._current_epoch)
+
         self.command = cast(CommandNode, self.command)
-        self.command.process()
+        self.command.process(self._current_epoch, input)
         self._logger.debug("awaiting epoch %s", self._current_epoch)
         self.tube.scheduler.await_epoch(self._current_epoch)
         if self._to_throw:
             self._throw_error()
         self._logger.debug("collecting return")
         return self.collect_return(self._current_epoch)
+
+    def _mark_pseudo_nodes_done(self, epoch: int) -> None:
+        """Mark pseudo-nodes as done in the scheduler.
+
+        Pseudo-nodes like 'input' and 'assets' don't emit events via ZMQ,
+        but may appear in the dependency graph. Mark them done so dependent
+        nodes can proceed.
+
+        Note: We call done() directly without get_ready() because the scheduler
+        handles this case via internal graphlib surgery (see scheduler.py:223-233).
+        """
+        # Find pseudo-nodes that are sources in the edges
+        pseudo_sources = {
+            edge.source_node
+            for edge in self.tube.scheduler.edges
+            if edge.source_node in ("input", "assets")
+        }
+        for pseudo_node in pseudo_sources:
+            self.tube.scheduler.done(epoch, pseudo_node)
 
     def on_event(self, msg: Message) -> None:
         self._logger.debug("EVENT received: %s", msg)

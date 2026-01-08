@@ -63,7 +63,7 @@ class Scheduler(BaseModel):
         Add another epoch with a prepared graph to the scheduler.
         """
         with self._ready_condition:
-            if epoch:
+            if epoch is not None:
                 this_epoch = epoch
                 # ensure that the next iteration of the clock will return the next number
                 # if we create epochs out of order
@@ -268,9 +268,10 @@ class Scheduler(BaseModel):
             if not self.node_is_ready(node_id, epoch):
                 self._ready_condition.wait_for(lambda: self.node_is_ready(node_id, epoch))
 
-            # be FIFO-like and get the earliest epoch the node is ready in
+            # Get the numerically lowest epoch the node is ready in.
+            # This ensures epochs are processed in order regardless of insertion order.
             if epoch is None:
-                for ep in self._epochs:
+                for ep in sorted(self._epochs):
                     if self.node_is_ready(node_id, ep):
                         epoch = ep
                         break
@@ -282,10 +283,13 @@ class Scheduler(BaseModel):
                     "locked between threads."
                 )
 
-            # do a little graphlib surgery to mark just one event as done.
-            # threadsafe because we are holding the lock that protects graph mutation
-            self._epochs[epoch]._node2info[node_id].npredecessors = _NODE_OUT  # type: ignore[attr-defined]
-            self._epochs[epoch]._ready_nodes.remove(node_id)  # type: ignore[attr-defined]
+            # If the epoch is already completed (in _epoch_log), skip the graph surgery
+            # since the epoch data no longer exists in _epochs
+            if epoch not in self._epoch_log:
+                # do a little graphlib surgery to mark just one event as done.
+                # threadsafe because we are holding the lock that protects graph mutation
+                self._epochs[epoch]._node2info[node_id].npredecessors = _NODE_OUT  # type: ignore[attr-defined]
+                self._epochs[epoch]._ready_nodes.remove(node_id)  # type: ignore[attr-defined]
 
         return MetaEvent(
             id=uuid4().int,
