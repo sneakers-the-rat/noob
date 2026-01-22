@@ -154,8 +154,72 @@ Picklable = Annotated[
 
 # type aliases, mostly for documentation's sake
 NodeID: TypeAlias = Annotated[str, AfterValidator(_is_identifier), AfterValidator(_not_reserved)]
-Epoch: TypeAlias = Annotated[int, Ge(0)]
 SignalName: TypeAlias = Annotated[str, AfterValidator(_is_identifier)]
+
+# Epoch type system for hierarchical epochs (supporting map/gather)
+EpochSegment: TypeAlias = tuple[int, str]
+"""
+A single segment of a hierarchical epoch: (index, node_id).
+
+- `index`: The position within the parent epoch (0-indexed)
+- `node_id`: The ID of the node that created this epoch level (e.g., a map node)
+
+Example: (2, "map_a") means the 3rd item from map node "map_a"
+"""
+
+Epoch: TypeAlias = tuple[EpochSegment, ...]
+"""
+A hierarchical epoch represented as a tuple of segments.
+
+Examples:
+- ((0, "root"),) - First epoch at root level
+- ((0, "root"), (2, "map_a")) - Third sub-epoch from map node "map_a"
+- ((0, "root"), (1, "map_a"), (0, "map_b")) - Nested map epochs
+"""
+
+
+def make_root_epoch(index: int, node_id: str = "root") -> Epoch:
+    """Create a root-level epoch."""
+    return ((index, node_id),)
+
+
+def make_sub_epoch(parent: Epoch, index: int, node_id: str) -> Epoch:
+    """Create a sub-epoch by appending a new segment to the parent epoch."""
+    return parent + ((index, node_id),)
+
+
+def epoch_parent(epoch: Epoch) -> Epoch | None:
+    """Get the parent epoch (all segments except the last), or None if at root."""
+    if len(epoch) <= 1:
+        return None
+    return epoch[:-1]
+
+
+def epoch_depth(epoch: Epoch) -> int:
+    """Get the depth of an epoch (number of segments)."""
+    return len(epoch)
+
+
+def epoch_at_depth(epoch: Epoch, depth: int) -> Epoch:
+    """Get the epoch truncated to a specific depth."""
+    return epoch[:depth]
+
+
+def epoch_is_descendant(child: Epoch, ancestor: Epoch) -> bool:
+    """Check if `child` is a descendant of `ancestor` (or equal to it)."""
+    if len(child) < len(ancestor):
+        return False
+    return child[: len(ancestor)] == ancestor
+
+
+def epoch_root_index(epoch: Epoch) -> int:
+    """Get the root-level index of an epoch."""
+    return epoch[0][0]
+
+
+def epoch_from_int(index: int, node_id: str = "root") -> Epoch:
+    """Convert a simple integer epoch to the new hierarchical format."""
+    return make_root_epoch(index, node_id)
 
 ReturnNodeType: TypeAlias = None | dict[str, Any] | Any
 

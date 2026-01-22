@@ -6,9 +6,11 @@ from typing import Any
 from noob.asset import AssetScope
 from noob.event import MetaEvent
 from noob.node import Node, Return
+from noob.node.gather import Gather, GatherResult
+from noob.node.map import Map, MapResult
 from noob.runner.base import TubeRunner
 from noob.scheduler import Scheduler
-from noob.types import ReturnNodeType
+from noob.types import Epoch, ReturnNodeType, epoch_parent
 from noob.utils import iscoroutinefunction_partial
 
 
@@ -97,7 +99,7 @@ class AsyncRunner(TubeRunner):
         # FIXME: since nodes can run quasiconcurrently, need to ensure unique assets per node
         self.tube.state.init(AssetScope.node, node.edges)
         args, kwargs = self._collect_input(node, epoch, input)
-        node, args, kwargs = self._before_call_node(node, *args, **kwargs)
+        node, args, kwargs = self._before_call_node(node, epoch, *args, **kwargs)
         value = self._call_node(node, *args, **kwargs)
         node, value = self._after_call_node(node, value)
         self._handle_events(node, value, epoch)
@@ -144,7 +146,7 @@ class AsyncRunner(TubeRunner):
                 evts.append(node)
         return evts
 
-    def _node_complete(self, future: asyncio.Future, node: Node, epoch: int) -> None:
+    def _node_complete(self, future: asyncio.Future, node: Node, epoch: Epoch) -> None:
         self._pending_futures.remove(future)
         if future.exception():
             self._logger.debug("Node %s raised exception, re-raising outside of callback")
@@ -154,6 +156,21 @@ class AsyncRunner(TubeRunner):
             return
 
         value = future.result()
+
+        # Handle MapResult specially
+        if isinstance(value, MapResult):
+            self._handle_map_result_async(node, value, epoch)
+            self.tube.state.deinit(AssetScope.node, node.edges)
+            self._node_ready.set()
+            return
+
+        # Handle GatherResult specially
+        if isinstance(value, GatherResult):
+            self._handle_gather_result_async(node, value, epoch)
+            self.tube.state.deinit(AssetScope.node, node.edges)
+            self._node_ready.set()
+            return
+
         events = self.store.add_value(node.signals, value, node.id, epoch)
         if events is not None:
             all_events = self.tube.scheduler.update(events)
@@ -163,6 +180,58 @@ class AsyncRunner(TubeRunner):
             self._call_callbacks(all_events)
         self._node_ready.set()
         self._logger.debug("Node %s emitted %s in epoch %s", node.id, value, epoch)
+
+    def _handle_map_result_async(self, node: Node, result: MapResult, epoch: Epoch) -> None:
+        """Handle MapResult in async runner."""
+        # Create sub-epochs in scheduler
+        self.tube.scheduler.add_sub_epochs(
+            result.parent_epoch, len(result.events), result.map_node_id
+        )
+
+        # Store each pre-created event
+        all_events = []
+        for event in result.events:
+            self.store.add(event)
+            all_events.append(event)
+
+        # Mark the map node as EXPIRED in the parent epoch
+        # This marks it complete without making successors ready in parent epoch
+        self.tube.scheduler.expire(epoch, node.id)
+
+        # Note: Map node is already marked done in sub-epochs by add_sub_epochs()
+
+        self._call_callbacks(all_events)
+        self._logger.debug(
+            "Map node %s created %d sub-epochs from epoch %s",
+            node.id,
+            len(result.events),
+            epoch,
+        )
+
+    def _handle_gather_result_async(self, node: Node, result: GatherResult, epoch: Epoch) -> None:
+        """Handle GatherResult in async runner."""
+        # Store the result at the target epoch
+        events = self.store.add_value(node.signals, result.value, node.id, result.target_epoch)
+
+        if node.id in self.tube.state.dependencies:
+            self.tube.state.update(events)
+
+        # Collapse sub-epochs if we have a source map node
+        if result.source_map_node_id:
+            self.tube.scheduler.collapse_subepochs(result.target_epoch, result.source_map_node_id)
+
+        # Mark done in the current epoch
+        self.tube.scheduler.done(epoch, node.id)
+
+        # Update scheduler for the target epoch
+        events_and_metaevents = self.tube.scheduler.update(events)
+        self._call_callbacks(events_and_metaevents)
+        self._logger.debug(
+            "Gather node %s collapsed to epoch %s with %d items",
+            node.id,
+            result.target_epoch,
+            len(result.value),
+        )
 
     async def _raise_exception(self) -> None:
         if not self._exception:

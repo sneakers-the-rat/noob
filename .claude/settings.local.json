@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(pdm run pytest:*)",
+      "Bash(NOOB_LOGS__LEVEL=\"DEBUG\" pdm run pytest:*)",
+      "Bash(NOOB_LOGS__LEVEL=\"DEBUG\" pdm run test:*)",
+      "Bash(pdm run test:*)"
+    ]
+  }
+}

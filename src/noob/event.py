@@ -2,7 +2,7 @@ import sys
 from enum import StrEnum
 from typing import Any, Literal
 
-from noob.types import Picklable, SerializableDatetime
+from noob.types import Epoch, Picklable, SerializableDatetime
 
 if sys.version_info < (3, 12):
     from typing_extensions import TypedDict
@@ -23,8 +23,8 @@ class Event(TypedDict):
     """ID of node that emitted the event"""
     signal: str
     """name of the signal that emitted the event"""
-    epoch: int
-    """Epoch number the event was emitted in"""
+    epoch: Epoch
+    """Hierarchical epoch tuple indicating when the event was emitted"""
     value: Picklable[Any]
     """Value emitted by the processing node"""
 
