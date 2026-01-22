@@ -15,6 +15,8 @@ from noob.asset import AssetSpecification
 from noob.exceptions import InputMissingError
 from noob.input import InputCollection, InputScope, InputSpecification
 from noob.node import Edge, Node, NodeSpecification, Return
+from noob.node.gather import Gather
+from noob.node.map import Map
 from noob.scheduler import Scheduler
 from noob.state import State
 from noob.types import ConfigSource, PythonIdentifier
@@ -358,6 +360,123 @@ class Tube(BaseModel):
                     "Access it by emitting it from another node and depending on that signal. "
                     f"Node {successor} cannot depend on assets.{asset.id}."
                 )
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_map_ancestry(self) -> Self:
+        """
+        Validate that nodes do not depend on multiple unrelated map nodes.
+
+        A node can depend on:
+        - Multiple signals from the same map ancestry chain
+        - One map ancestry chain plus non-mapped signals
+
+        A node CANNOT depend on:
+        - Signals from two different, unrelated map nodes (ambiguous epoch alignment)
+
+        This check traces back from each node to find its map ancestry and validates
+        that there are no conflicts.
+        """
+
+        def find_map_ancestors(node_id: str, visited: set[str] | None = None) -> set[str]:
+            """Find all map node IDs that are ancestors of this node."""
+            if visited is None:
+                visited = set()
+            if node_id in visited:
+                return set()
+            visited.add(node_id)
+
+            map_ancestors: set[str] = set()
+
+            # Check if this node itself is a map
+            if node_id in self.nodes and isinstance(self.nodes[node_id], Map):
+                map_ancestors.add(node_id)
+
+            # Trace through dependencies
+            if node_id in self.nodes:
+                node = self.nodes[node_id]
+                for edge in node.edges:
+                    # Recursively find map ancestors of this dependency
+                    map_ancestors.update(find_map_ancestors(edge.source_node, visited.copy()))
+
+            return map_ancestors
+
+        def find_map_chains(node_id: str) -> list[list[str]]:
+            """
+            Find all map chains leading to this node.
+            A chain is a list of map node IDs in dependency order.
+            """
+            if node_id not in self.nodes:
+                return []
+
+            node = self.nodes[node_id]
+            chains: list[list[str]] = []
+
+            for edge in node.edges:
+                dep_node_id = edge.source_node
+                if dep_node_id not in self.nodes:
+                    continue
+
+                # Get chains from this dependency
+                dep_chains = find_map_chains(dep_node_id)
+
+                # If the dependency is a map, add it to each chain
+                if isinstance(self.nodes[dep_node_id], Map):
+                    if dep_chains:
+                        for chain in dep_chains:
+                            chains.append([dep_node_id] + chain)
+                    else:
+                        chains.append([dep_node_id])
+                else:
+                    chains.extend(dep_chains)
+
+            return chains
+
+        # Check each node for map ancestry conflicts
+        for node_id, node in self.nodes.items():
+            if isinstance(node, (Map, Gather)):
+                # Map and Gather nodes have special handling
+                continue
+
+            map_chains = find_map_chains(node_id)
+
+            if len(map_chains) <= 1:
+                continue
+
+            # Check if all chains are nested (one is a suffix of another)
+            # Chains are ordered innermost-first, so the last element is the root map
+            # Valid: [[b], [c, b]] - c is nested inside b, they share root b
+            # Invalid: [[a], [b]] - two unrelated map chains with different roots
+            #
+            # For chains to be related, they must share a common root (last element)
+            # AND any longer chain must be an extension (suffix) of the shorter one
+            if len(map_chains) <= 1:
+                continue
+
+            # Check that all chains share the same root (outermost map)
+            roots = set()
+            for chain in map_chains:
+                if chain:
+                    roots.add(chain[-1])  # Last element is the root (outermost map)
+
+            if len(roots) > 1:
+                raise ValueError(
+                    f"Node '{node_id}' depends on signals from multiple unrelated map nodes: "
+                    f"{roots}. A node cannot depend on multiple independent map expansions "
+                    "as epoch alignment would be ambiguous."
+                )
+
+            # Also verify that chains are properly nested (each shorter chain is a suffix of longer ones)
+            sorted_chains = sorted(map_chains, key=len)
+            for i in range(len(sorted_chains) - 1):
+                shorter = sorted_chains[i]
+                longer = sorted_chains[i + 1]
+                if shorter and shorter != longer[-len(shorter):]:
+                    raise ValueError(
+                        f"Node '{node_id}' depends on signals from improperly nested map nodes. "
+                        f"Chain {shorter} is not a suffix of {longer}."
+                    )
 
         return self
 

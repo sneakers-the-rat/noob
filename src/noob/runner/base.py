@@ -21,8 +21,10 @@ from noob.event import Event, MetaEvent
 from noob.exceptions import InputMissingError
 from noob.input import InputScope
 from noob.node import Edge, Node
+from noob.node.gather import Gather, GatherResult
+from noob.node.map import Map, MapResult
 from noob.store import EventStore
-from noob.types import PythonIdentifier, ReturnNodeType, RunnerContext
+from noob.types import Epoch, PythonIdentifier, ReturnNodeType, RunnerContext, epoch_parent
 from noob.utils import iscoroutinefunction_partial
 
 if TYPE_CHECKING:
@@ -228,7 +230,7 @@ class TubeRunner(ABC):
 
         with self._asset_context(AssetScope.node, node.edges):
             args, kwargs = self._collect_input(node, epoch, input)
-            node, args, kwargs = self._before_call_node(node, *args, **kwargs)
+            node, args, kwargs = self._before_call_node(node, epoch, *args, **kwargs)
             value = self._call_node(node, *args, **kwargs)
             node, value = self._after_call_node(node, value)
             self._handle_events(node, value, epoch)
@@ -277,10 +279,14 @@ class TubeRunner(ABC):
         return self.tube.nodes[node_id]
 
     def _collect_input(
-        self, node: Node, epoch: int, input: dict | None = None
+        self, node: Node, epoch: Epoch, input: dict | None = None
     ) -> tuple[tuple, dict[PythonIdentifier, Any]]:
         """
         Gather input to give to the passed Node from the :attr:`.TubeRunner.store`
+
+        Uses hierarchical lookup - if a dependency isn't found at the current epoch,
+        searches up the epoch hierarchy. This allows nodes in sub-epochs (from map)
+        to access events from parent epochs.
 
         Returns:
             dict: kwargs to pass to :meth:`.Node.process` if matching events are present
@@ -300,7 +306,8 @@ class TubeRunner(ABC):
         state_inputs = self.tube.state.collect(edges, epoch)
         inputs |= state_inputs if state_inputs else inputs
 
-        event_inputs = self.store.collect(edges, epoch)
+        # Use hierarchical lookup for events (search up epoch tree)
+        event_inputs = self.store.collect(edges, epoch, hierarchical=True)
         inputs |= event_inputs if event_inputs else inputs
 
         input_inputs = self.tube.input_collection.collect(edges, input)
@@ -310,12 +317,37 @@ class TubeRunner(ABC):
 
         return args, kwargs
 
-    def _before_call_node(self, node: Node, *args: Any, **kwargs: Any) -> tuple[Node, tuple, dict]:
+    def _before_call_node(
+        self, node: Node, epoch: Epoch, *args: Any, **kwargs: Any
+    ) -> tuple[Node, tuple, dict]:
         """
         Hook to modify behavior before calling the node.
 
-        Default is no-op
+        Injects epoch context for Map and Gather nodes.
         """
+        # Inject epoch context for Map nodes
+        if isinstance(node, Map):
+            node.set_epoch_context(epoch)
+
+        # Inject epoch context for Gather nodes
+        if isinstance(node, Gather):
+            # Check if this is in a sub-epoch from a map
+            expected_count = None
+            source_map_node_id = None
+
+            # Get parent epoch info for map collapse mode
+            parent = epoch_parent(epoch)
+            if parent is not None and len(epoch) > 1:
+                # We're in a sub-epoch - check for expected count from scheduler
+                map_node_id = epoch[-1][1]  # The node that created this sub-epoch
+                expected_count = self.tube.scheduler.get_expected_subepoch_count(
+                    parent, map_node_id
+                )
+                if expected_count is not None:
+                    source_map_node_id = map_node_id
+
+            node.set_epoch_context(epoch, expected_count, source_map_node_id)
+
         return node, args, kwargs
 
     def _call_node(self, node: Node, *args: Any, **kwargs: Any) -> Any:
@@ -339,7 +371,7 @@ class TubeRunner(ABC):
         """
         return node, value
 
-    def _handle_events(self, node: Node, value: Any, epoch: int) -> None:
+    def _handle_events(self, node: Node, value: Any, epoch: Epoch) -> None:
         """
         After calling a node, handle its return value:
 
@@ -357,15 +389,96 @@ class TubeRunner(ABC):
         * calls :meth:`.Scheduler.update` to update the scheduler
         * calls :meth:`._call_callbacks` to emit events to callbacks
 
+        Special handling for:
+        * MapResult: Creates sub-epochs and stores pre-created events
+        * GatherResult: Stores at target epoch and collapses sub-epochs
+
         However other implementations may perform the responsibilities asynchronously
         e.g. via futures, see :class:`.AsyncIORunner` for an example.
         """
+        # Handle MapResult specially
+        if isinstance(value, MapResult):
+            self._handle_map_result(node, value, epoch)
+            return
+
+        # Handle GatherResult specially
+        if isinstance(value, GatherResult):
+            self._handle_gather_result(node, value, epoch)
+            return
+
+        # Standard event handling
         events = self.store.add_value(node.signals, value, node.id, epoch)
         if node.id in self.tube.state.dependencies:
             self.tube.state.update(events)
         events_and_metaevents = self.tube.scheduler.update(events)
         self._call_callbacks(events_and_metaevents)
         self._logger.debug("Node %s emitted %s in epoch %s", node.id, value, epoch)
+
+    def _handle_map_result(self, node: Node, result: MapResult, epoch: Epoch) -> None:
+        """
+        Handle MapResult from a Map node:
+        1. Create sub-epochs in the scheduler
+        2. Store pre-created events directly
+        3. Mark map as expired in parent (successors don't become ready there)
+        4. Mark map as done in sub-epochs (successors become ready there)
+        """
+        # Create sub-epochs in scheduler
+        sub_epochs = self.tube.scheduler.add_sub_epochs(
+            result.parent_epoch, len(result.events), result.map_node_id
+        )
+
+        # Store each pre-created event
+        all_events = []
+        for event in result.events:
+            self.store.add(event)
+            all_events.append(event)
+
+        # Mark the map node as EXPIRED in the parent epoch
+        # This marks it complete without making successors ready in parent epoch
+        self.tube.scheduler.expire(epoch, node.id)
+
+        # Note: Map node is already marked done in sub-epochs by add_sub_epochs()
+
+        self._call_callbacks(all_events)
+        self._logger.debug(
+            "Map node %s created %d sub-epochs from epoch %s",
+            node.id,
+            len(result.events),
+            epoch,
+        )
+
+    def _handle_gather_result(self, node: Node, result: GatherResult, epoch: Epoch) -> None:
+        """
+        Handle GatherResult from a Gather node:
+        1. Store the gathered value at the target (collapsed) epoch
+        2. Clean up sub-epoch tracking
+        """
+        # Store the result at the target epoch
+        events = self.store.add_value(node.signals, result.value, node.id, result.target_epoch)
+
+        if node.id in self.tube.state.dependencies:
+            self.tube.state.update(events)
+
+        # Mark done in the current epoch first
+        self.tube.scheduler.done(epoch, node.id)
+
+        # Update scheduler for the target epoch BEFORE collapsing
+        # This marks the gather node as done in the parent epoch before
+        # _check_subepoch_completion fires (which would try to expire it)
+        events_and_metaevents = self.tube.scheduler.update(events)
+
+        # Collapse sub-epochs if we have a source map node
+        # This must happen AFTER update() so the gather is marked done
+        if result.source_map_node_id:
+            self.tube.scheduler.collapse_subepochs(result.target_epoch, result.source_map_node_id)
+
+        self._call_callbacks(events_and_metaevents)
+        self._logger.debug(
+            "Gather node %s collapsed to epoch %s with %d items",
+            node.id,
+            result.target_epoch,
+            len(result.value),
+        )
 
     @contextmanager
     def _asset_context(self, scope: AssetScope, edges: list[Edge] | None = None) -> Iterator[None]:

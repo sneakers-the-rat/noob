@@ -74,8 +74,15 @@ def concat(strings: list[str]) -> str:
     return "".join(strings)
 
 
-def multi_concat(**kwargs: list[str]) -> str:
-    return "".join("".join(letter for letter in word) for word in kwargs.values())
+def multi_concat(a: list[str] | None = None, b: list[str] | None = None, **kwargs: list[str]) -> str:
+    """Concatenate multiple lists of strings together."""
+    all_values = []
+    if a is not None:
+        all_values.append(a)
+    if b is not None:
+        all_values.append(b)
+    all_values.extend(kwargs.values())
+    return "".join("".join(letter for letter in word) for word in all_values)
 
 
 def exclaim(string: str, hype: int = 1) -> str:

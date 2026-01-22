@@ -13,7 +13,7 @@ from noob.const import META_SIGNAL
 from noob.event import Event, MetaSignal
 from noob.node import Edge
 from noob.node.base import Signal
-from noob.types import Epoch, NodeID, SignalName
+from noob.types import Epoch, NodeID, SignalName, epoch_is_descendant, epoch_parent
 
 EventDict: TypeAlias = dict[Epoch, dict[NodeID, dict[SignalName, list[Event]]]]
 """
@@ -21,7 +21,7 @@ A nested dictionary to store events for rapid access
 (vs. the old implementation which was just a big list to filter).
 
 Stores by epoch, node_id, and signal, like
-events = {'epoch': {'node_id': {'signal': [...]}}}
+events = {epoch_tuple: {'node_id': {'signal': [...]}}}
 
 Should be made with a `defaultdict` to avoid annoying nested indexing problems
 """
@@ -64,7 +64,7 @@ class EventStore:
             self._event_condition.notify_all()
         return event
 
-    def add_value(self, signals: list[Signal], value: Any, node_id: str, epoch: int) -> list[Event]:
+    def add_value(self, signals: list[Signal], value: Any, node_id: str, epoch: Epoch) -> list[Event]:
         """
         Add the result of a :meth:`.Node.process` call to the event store.
 
@@ -78,7 +78,7 @@ class EventStore:
                 with a list in case the length of signals is 1. Otherwise, it's zipped
                 with :signals:
             node_id (str): ID of the node that emitted the events
-            epoch (int): Epoch count that the signal was emitted in
+            epoch (Epoch): Hierarchical epoch tuple that the signal was emitted in
         """
         timestamp = datetime.now(UTC)
         if value is MetaSignal.NoEvent or (isinstance(value, str) and value == MetaSignal.NoEvent):
@@ -103,33 +103,85 @@ class EventStore:
             self._event_condition.notify_all()
         return new_events
 
-    def get(self, node_id: str, signal: str, epoch: int) -> Event:
+    def get(self, node_id: str, signal: str, epoch: Epoch) -> Event:
         """
         Get the event with the matching node_id and signal name from a given epoch.
-
-        If epoch is `-1`, return the most recent event.
 
         Raises:
             KeyError: if no event with the matching node_id and signal name exists
         """
-        event = None
-        if epoch == -1:
-            for ep in reversed(self.events.keys()):
-                if (evt := self.get(node_id, signal, ep)) is not None:
-                    event = evt
-                    break
-        else:
-            events = self.events[epoch][node_id][signal]
-            event = events[-1] if events else None
+        events = self.events[epoch][node_id][signal]
+        event = events[-1] if events else None
 
         if event is None:
             raise KeyError(
                 f"No event found for node_id: {node_id}, signal: {signal}, epoch: {epoch}"
             )
-        else:
-            return event
+        return event
 
-    def collect(self, edges: list[Edge], epoch: int) -> dict | None:
+    def get_at_or_above(self, node_id: str, signal: str, epoch: Epoch) -> Event:
+        """
+        Get an event at the given epoch, or search up the epoch hierarchy.
+
+        This is used when a node depends on a signal that was emitted at a higher
+        (parent) epoch level - e.g., a mapped node depending on a non-mapped signal.
+
+        Raises:
+            KeyError: if no event found at this epoch or any ancestor epoch
+        """
+        current: Epoch | None = epoch
+        while current is not None:
+            try:
+                return self.get(node_id, signal, current)
+            except KeyError:
+                current = epoch_parent(current)
+
+        raise KeyError(
+            f"No event found for node_id: {node_id}, signal: {signal}, "
+            f"at epoch {epoch} or any ancestor"
+        )
+
+    def collect_across_subepochs(
+        self, node_id: str, signal: str, parent_epoch: Epoch
+    ) -> list[Event]:
+        """
+        Collect all events from sub-epochs that are descendants of the given parent epoch.
+
+        For nested maps, this searches all depth levels to find events.
+
+        Returns:
+            List of events sorted by their full epoch path
+        """
+        events = []
+        for epoch, epoch_events in self.events.items():
+            # Check if this epoch is ANY descendant of parent_epoch (not just direct child)
+            if len(epoch) > len(parent_epoch) and epoch_is_descendant(epoch, parent_epoch):
+                if node_id in epoch_events and signal in epoch_events[node_id]:
+                    events.extend(epoch_events[node_id][signal])
+
+        # Sort by the full epoch path to maintain proper ordering
+        events.sort(key=lambda e: e["epoch"])
+        return events
+
+    def get_subepoch_count(self, parent_epoch: Epoch, node_id: str) -> int:
+        """
+        Count the number of sub-epochs created by a specific node under a parent epoch.
+
+        Used to determine when all mapped events have been received.
+        """
+        count = 0
+        for epoch in self.events.keys():
+            if (
+                len(epoch) == len(parent_epoch) + 1
+                and epoch_is_descendant(epoch, parent_epoch)
+                and epoch[-1][1] == node_id
+            ):
+                count += 1
+        return count
+
+    def collect(
+        self, edges: list[Edge], epoch: Epoch, hierarchical: bool = True
+    ) -> dict | None:
         """
         Gather events into a form that can be consumed by a :meth:`.Node.process` method,
         given the collection of inbound edges (usually from :meth:`.Tube.in_edges` ).
@@ -143,22 +195,26 @@ class EventStore:
         (`None` is a valid value for an event, so if a key is present and the value is `None`,
         the event was emitted with a value of `None`)
 
-        If `epoch` is -1,
-        get the the events from the most recent epoch where all events are present,
-        and if no epochs are present with a full set of events, return None
+        Args:
+            edges: List of edges from which to collect events
+            epoch: The epoch to collect events from
+            hierarchical: If True, search up the epoch hierarchy for missing events.
+                This allows nodes in sub-epochs to access events from parent epochs.
 
         .. todo::
 
             Add an example
 
         """
-        events = self.collect_events(edges, epoch)
+        events = self.collect_events(edges, epoch, hierarchical)
         if events is None:
             return None
 
         return self.transform_events(edges=edges, events=events)
 
-    def collect_events(self, edges: list[Edge], epoch: int) -> list[Event] | None:
+    def collect_events(
+        self, edges: list[Edge], epoch: Epoch, hierarchical: bool = True
+    ) -> list[Event] | None:
         """
         Collect the event objects from a set of dependencies indicated by edges in a given epoch.
 
@@ -169,20 +225,42 @@ class EventStore:
 
         Args:
             edges (list[Edge]): List of edges from which to collect events
-            epoch (int): Epoch to select from, if -1, get the latest complete set of events.
+            epoch (Epoch): Epoch to select from
+            hierarchical: If True, use hierarchical lookup (search ancestors and descendants)
         """
         events = []
         for edge in edges:
             try:
-                event = self.get(edge.source_node, edge.source_signal, epoch)
+                if hierarchical:
+                    event = self.get_at_or_above(edge.source_node, edge.source_signal, epoch)
+                else:
+                    event = self.get(edge.source_node, edge.source_signal, epoch)
                 events.append(event)
             except KeyError:
+                if hierarchical:
+                    # Try collecting from sub-epochs (for mapped signals)
+                    sub_events = self.collect_across_subepochs(
+                        edge.source_node, edge.source_signal, epoch
+                    )
+                    if sub_events:
+                        # Wrap multiple events as a list value in a synthetic event
+                        values = [e["value"] for e in sub_events]
+                        synthetic_event = Event(
+                            id=sub_events[0]["id"],
+                            timestamp=sub_events[0]["timestamp"],
+                            node_id=edge.source_node,
+                            epoch=epoch,
+                            signal=edge.source_signal,
+                            value=values,
+                        )
+                        events.append(synthetic_event)
+                        continue
                 # no matching event
                 continue
 
         return events if events else None
 
-    def clear(self, epoch: int | None = None) -> None:
+    def clear(self, epoch: Epoch | None = None) -> None:
         """
         Clear events for a specific or all epochs.
 
@@ -193,6 +271,20 @@ class EventStore:
             self.events = _make_event_dict()
         else:
             del self.events[epoch]
+
+    def clear_subepochs(self, parent_epoch: Epoch) -> None:
+        """
+        Clear all events from sub-epochs of the given parent epoch.
+
+        Used after a gather operation collapses sub-epochs.
+        """
+        to_delete = [
+            ep
+            for ep in self.events.keys()
+            if len(ep) > len(parent_epoch) and epoch_is_descendant(ep, parent_epoch)
+        ]
+        for ep in to_delete:
+            del self.events[ep]
 
     @staticmethod
     def transform_events(edges: list[Edge], events: list[Event]) -> dict:

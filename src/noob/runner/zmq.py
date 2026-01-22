@@ -68,10 +68,12 @@ from noob.network.message import (
     StopMsg,
 )
 from noob.node import Node, NodeSpecification, Return, Signal
+from noob.node.gather import Gather, GatherResult
+from noob.node.map import Map, MapResult
 from noob.runner.base import TubeRunner, call_async_from_sync
 from noob.scheduler import Scheduler
 from noob.store import EventStore
-from noob.types import NodeID, ReturnNodeType
+from noob.types import Epoch, NodeID, ReturnNodeType, epoch_parent, make_root_epoch
 from noob.utils import iscoroutinefunction_partial
 
 if TYPE_CHECKING:
@@ -181,7 +183,7 @@ class CommandNode(EventloopMixin):
         )
         self._outbox.send_multipart([b"announce", msg.to_bytes()])
 
-    def process(self, epoch: int, input: dict | None = None) -> None:
+    def process(self, epoch: Epoch, input: dict | None = None) -> None:
         """Emit a ProcessMsg to process a single round through the graph"""
         # no empty dicts
         input = input if input else None
@@ -382,11 +384,42 @@ class NodeRunner(EventloopMixin):
                 runner.logger.debug(
                     "Running with args: %s, kwargs: %s, epoch: %s", args, kwargs, epoch
                 )
+
+                # Inject epoch context for Map nodes
+                if isinstance(runner._node, Map):
+                    runner._node.set_epoch_context(epoch)
+
+                # Inject epoch context for Gather nodes
+                if isinstance(runner._node, Gather):
+                    # Get expected count from scheduler for map collapse mode
+                    expected_count = None
+                    source_map_node_id = None
+                    parent = epoch_parent(epoch)
+                    if parent is not None and len(epoch) > 1:
+                        map_node_id = epoch[-1][1]
+                        expected_count = runner.scheduler.get_expected_subepoch_count(
+                            parent, map_node_id
+                        )
+                        if expected_count is not None:
+                            source_map_node_id = map_node_id
+                    runner._node.set_epoch_context(epoch, expected_count, source_map_node_id)
+
                 if is_async:
                     # mypy fails here because it can't propagate the type guard above
                     value = call_async_from_sync(runner._node.process, *args, **kwargs)  # type: ignore[arg-type]
                 else:
                     value = runner._node.process(*args, **kwargs)
+
+                # Handle MapResult specially
+                if isinstance(value, MapResult):
+                    runner._handle_map_result(value, epoch)
+                    continue
+
+                # Handle GatherResult specially
+                if isinstance(value, GatherResult):
+                    runner._handle_gather_result(value, epoch)
+                    continue
+
                 events = runner.store.add_value(runner._node.signals, value, runner._node.id, epoch)
                 runner.scheduler.add_epoch()
 
@@ -403,7 +436,62 @@ class NodeRunner(EventloopMixin):
         finally:
             runner.deinit()
 
-    def await_inputs(self) -> Generator[tuple[tuple[Any], dict[str, Any], int]]:
+    def _handle_map_result(self, result: MapResult, epoch: Epoch) -> None:
+        """Handle MapResult in NodeRunner."""
+        self._node = cast(Node, self._node)
+
+        # Create sub-epochs in scheduler
+        self.scheduler.add_sub_epochs(
+            result.parent_epoch, len(result.events), result.map_node_id
+        )
+
+        # Store each event
+        for event in result.events:
+            self.store.add(event)
+
+        # Mark EXPIRED in parent epoch (successors don't become ready there)
+        self.scheduler.expire(epoch, self._node.id)
+
+        # Note: Map node is already marked done in sub-epochs by add_sub_epochs()
+
+        # Publish all events
+        self.publish_events(result.events)
+        self.logger.debug(
+            "Map node %s created %d sub-epochs from epoch %s",
+            self._node.id,
+            len(result.events),
+            epoch,
+        )
+
+    def _handle_gather_result(self, result: GatherResult, epoch: Epoch) -> None:
+        """Handle GatherResult in NodeRunner."""
+        self._node = cast(Node, self._node)
+
+        # Store at target epoch
+        events = self.store.add_value(
+            self._node.signals, result.value, self._node.id, result.target_epoch
+        )
+
+        # Collapse sub-epochs
+        if result.source_map_node_id:
+            self.scheduler.collapse_subepochs(result.target_epoch, result.source_map_node_id)
+
+        # Mark done in current epoch
+        self.scheduler.done(epoch, self._node.id)
+
+        self.update_graph(events)
+        events = [e for e in events if e["node_id"] != "meta"]
+        if events:
+            self.publish_events(events)
+
+        self.logger.debug(
+            "Gather node %s collapsed to epoch %s with %d items",
+            self._node.id,
+            result.target_epoch,
+            len(result.value),
+        )
+
+    def await_inputs(self) -> Generator[tuple[tuple[Any], dict[str, Any], Epoch]]:
         self._node = cast(Node, self._node)
         while not self._process_quitting.is_set():
             # if we are not freerunning, keep track of how many times we are supposed to run,
@@ -417,9 +505,9 @@ class NodeRunner(EventloopMixin):
                     self._to_process = 0
                     self._process_one.clear()
 
-            epoch = next(self._counter) if self._node.stateful else None
-
-            ready = self.scheduler.await_node(self.spec.id, epoch=epoch)
+            # For stateful nodes, we track local epochs for ordering,
+            # but the actual epoch comes from the scheduler
+            ready = self.scheduler.await_node(self.spec.id, epoch=None)
             edges = self._node.edges
             inputs = self.store.collect(edges, ready["epoch"])
             if inputs is None:
@@ -678,7 +766,7 @@ class ZMQRunner(TubeRunner):
     _return_node: Return | None = None
     _init_lock: threading.Lock = field(default_factory=threading.Lock)
     _to_throw: ErrorValue | None = None
-    _current_epoch: int | None = None
+    _current_epoch: Epoch | None = None
 
     @property
     def running(self) -> bool:
@@ -795,7 +883,7 @@ class ZMQRunner(TubeRunner):
         if isinstance(msg, ErrorMsg):
             self._handle_error(msg)
 
-    def collect_return(self, epoch: int | None = None) -> Any:
+    def collect_return(self, epoch: Epoch | None = None) -> Any:
         if epoch is None:
             raise ValueError("Must specify epoch in concurrent runners")
         if self._return_node is None:

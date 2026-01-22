@@ -15,7 +15,7 @@ from noob.exceptions import EpochCompletedError, EpochExistsError, NotOutYetErro
 from noob.logging import init_logger
 from noob.node import Edge, NodeSpecification
 from noob.toposort import TopoSorter
-from noob.types import NodeID
+from noob.types import Epoch, NodeID, epoch_parent, make_root_epoch, make_sub_epoch
 
 _VIRTUAL_NODES = ("input", "assets")
 """
@@ -32,10 +32,12 @@ class Scheduler(BaseModel):
     logger: logging.Logger = Field(default_factory=lambda: init_logger("noob.scheduler"))
 
     _clock: count = PrivateAttr(default_factory=count)
-    _epochs: dict[int, TopoSorter] = PrivateAttr(default_factory=dict)
+    _epochs: dict[Epoch, TopoSorter] = PrivateAttr(default_factory=dict)
     _ready_condition: Condition = PrivateAttr(default_factory=Condition)
     _epoch_condition: Condition = PrivateAttr(default_factory=Condition)
-    _epoch_log: deque = PrivateAttr(default_factory=lambda: deque(maxlen=100))
+    _epoch_log: deque[Epoch] = PrivateAttr(default_factory=lambda: deque(maxlen=100))
+    _subepoch_counts: dict[Epoch, dict[str, int]] = PrivateAttr(default_factory=dict)
+    """Tracks expected sub-epoch counts per parent epoch per map node"""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -61,18 +63,29 @@ class Scheduler(BaseModel):
             self.source_nodes = [id_ for id_ in graph.ready_nodes if id_ not in _VIRTUAL_NODES]
         return self
 
-    def add_epoch(self, epoch: int | None = None) -> int:
+    def add_epoch(self, epoch: Epoch | None = None) -> Epoch:
         """
         Add another epoch with a prepared graph to the scheduler.
+
+        Args:
+            epoch: If provided, use this epoch. Otherwise, create a new root epoch
+                with the next clock value.
+
+        Returns:
+            The epoch that was added.
         """
         with self._ready_condition:
-            if epoch:
+            if epoch is not None:
                 this_epoch = epoch
                 # ensure that the next iteration of the clock will return the next number
                 # if we create epochs out of order
-                self._clock = count(max([this_epoch, *self._epochs.keys(), *self._epoch_log]) + 1)
+                root_indices = [e[0][0] for e in list(self._epochs.keys()) + list(self._epoch_log)]
+                if root_indices:
+                    max_root = max(root_indices)
+                    if epoch[0][0] >= max_root:
+                        self._clock = count(epoch[0][0] + 1)
             else:
-                this_epoch = next(self._clock)
+                this_epoch = make_root_epoch(next(self._clock))
 
             if this_epoch in self._epochs:
                 raise EpochExistsError(f"Epoch {this_epoch} is already scheduled")
@@ -84,26 +97,167 @@ class Scheduler(BaseModel):
             self._ready_condition.notify_all()
         return this_epoch
 
-    def is_active(self, epoch: int | None = None) -> bool:
+    def add_sub_epochs(
+        self, parent_epoch: Epoch, count: int, map_node_id: str
+    ) -> list[Epoch]:
+        """
+        Create sub-epochs for a map expansion.
+
+        Sub-epochs only contain the subgraph downstream of the map node,
+        since upstream nodes have already run in the parent epoch.
+
+        Args:
+            parent_epoch: The epoch the map node was called in
+            count: Number of items being mapped over
+            map_node_id: ID of the map node creating these sub-epochs
+
+        Returns:
+            List of sub-epochs created
+        """
+        sub_epochs = []
+        with self._ready_condition:
+            # Track expected count for gather nodes
+            if parent_epoch not in self._subepoch_counts:
+                self._subepoch_counts[parent_epoch] = {}
+            self._subepoch_counts[parent_epoch][map_node_id] = count
+
+            # Find all nodes downstream of the map node (including map itself)
+            downstream_nodes = self._get_downstream_nodes(map_node_id)
+
+            # Filter nodes and edges to only downstream ones
+            filtered_nodes = {
+                k: v for k, v in self.nodes.items() if k in downstream_nodes
+            }
+            filtered_edges = [
+                e for e in self.edges
+                if e.source_node in downstream_nodes and e.target_node in downstream_nodes
+            ]
+
+            for i in range(count):
+                sub_epoch = make_sub_epoch(parent_epoch, i, map_node_id)
+                if sub_epoch not in self._epochs:
+                    # Create a subgraph with only downstream nodes
+                    graph = self._init_graph(nodes=filtered_nodes, edges=filtered_edges)
+                    # Mark the map node as done - it already emitted in this sub-epoch
+                    graph.mark_out(map_node_id)
+                    graph.done(map_node_id)
+                    self._epochs[sub_epoch] = graph
+
+                    # If the graph is already inactive (no more nodes to process),
+                    # end the epoch immediately. This happens for innermost maps
+                    # that have no downstream nodes in the sub-epoch graph.
+                    if not graph.is_active():
+                        self.end_epoch(sub_epoch)
+
+                sub_epochs.append(sub_epoch)
+            self._ready_condition.notify_all()
+        return sub_epochs
+
+    def _get_downstream_nodes(self, node_id: str, exclude_sinks: bool = True) -> set[str]:
+        """
+        Get all nodes downstream of a given node (including the node itself).
+
+        Uses BFS to find all nodes reachable from the given node via edges.
+
+        Args:
+            node_id: Starting node
+            exclude_sinks: If True, exclude sink nodes (nodes with no successors,
+                like Return) from the result. Sinks should run in the parent epoch
+                to collect accumulated results.
+        """
+        # Build adjacency list: source -> targets
+        adjacency: dict[str, list[str]] = {}
+        for edge in self.edges:
+            if edge.source_node not in adjacency:
+                adjacency[edge.source_node] = []
+            adjacency[edge.source_node].append(edge.target_node)
+
+        # BFS from node_id
+        downstream = {node_id}
+        queue = [node_id]
+        while queue:
+            current = queue.pop(0)
+            for successor in adjacency.get(current, []):
+                if successor not in downstream:
+                    downstream.add(successor)
+                    queue.append(successor)
+
+        if exclude_sinks:
+            # Remove sink nodes (no outgoing edges) - they should run in parent epoch
+            sinks = {n for n in downstream if n not in adjacency or not adjacency[n]}
+            downstream -= sinks
+
+        return downstream
+
+    def _get_subepoch_nodes(self, map_node_id: str) -> set[str]:
+        """
+        Get nodes that run in sub-epochs created by a map node.
+
+        This is similar to _get_downstream_nodes but stops at Gather nodes.
+        Nodes downstream of a Gather run in the parent epoch after gather,
+        not in sub-epochs.
+
+        Args:
+            map_node_id: The map node that created the sub-epochs
+        """
+        # Build adjacency list: source -> targets
+        adjacency: dict[str, list[str]] = {}
+        for edge in self.edges:
+            if edge.source_node not in adjacency:
+                adjacency[edge.source_node] = []
+            adjacency[edge.source_node].append(edge.target_node)
+
+        # BFS from map_node_id, stopping at Gather nodes (include them but not their successors)
+        subepoch_nodes = {map_node_id}
+        queue = [map_node_id]
+        while queue:
+            current = queue.pop(0)
+            # If current is a Gather, don't traverse its successors
+            # (Gather runs in sub-epochs but its output goes to parent)
+            if current != map_node_id and self.nodes[current].type_ == "gather":
+                continue
+            for successor in adjacency.get(current, []):
+                if successor not in subepoch_nodes:
+                    subepoch_nodes.add(successor)
+                    queue.append(successor)
+
+        # Remove sink nodes - they should run in parent epoch
+        sinks = {n for n in subepoch_nodes if n not in adjacency or not adjacency[n]}
+        subepoch_nodes -= sinks
+
+        return subepoch_nodes
+
+    def get_expected_subepoch_count(self, parent_epoch: Epoch, map_node_id: str) -> int | None:
+        """Get the expected number of sub-epochs for a given parent and map node."""
+        if parent_epoch not in self._subepoch_counts:
+            return None
+        return self._subepoch_counts[parent_epoch].get(map_node_id)
+
+    def is_active(self, epoch: Epoch | None = None) -> bool:
         """
         Graph remains active while it holds at least one epoch that is active.
 
+        An epoch with pending sub-epochs is considered active even if its
+        TopoSorter reports no more work.
         """
         if epoch is not None:
             if epoch not in self._epochs:
                 # if an epoch has been completed and had its graph cleared, it's no longer active
                 # if an epoch has not been started, it is also not active.
                 return False
+            # Check if this epoch has pending sub-epochs
+            if epoch in self._subepoch_counts and self._subepoch_counts[epoch]:
+                return True
             return self._epochs[epoch].is_active()
         else:
-            return any(graph.is_active() for graph in self._epochs.values())
+            return any(self.is_active(ep) for ep in self._epochs)
 
-    def get_ready(self, epoch: int | None = None) -> list[MetaEvent]:
+    def get_ready(self, epoch: Epoch | None = None) -> list[MetaEvent]:
         """
         Output the set of nodes that are ready across different epochs.
 
         Args:
-            epoch (int | None): if an int, get ready events for that epoch,
+            epoch (Epoch | None): if an Epoch, get ready events for that epoch,
                 if ``None`` , get ready events for all epochs.
         """
 
@@ -116,23 +270,23 @@ class Scheduler(BaseModel):
                     timestamp=datetime.now(),
                     node_id="meta",
                     signal=MetaEventType.NodeReady,
-                    epoch=epoch,
+                    epoch=ep,
                     value=node_id,
                 )
-                for epoch, graph in graphs
+                for ep, graph in graphs
                 for node_id in graph.get_ready()
                 if node_id in _VIRTUAL_NODES or self.nodes[node_id].enabled
             ]
 
         return ready_nodes
 
-    def node_is_ready(self, node: NodeID, epoch: int | None = None) -> bool:
+    def node_is_ready(self, node: NodeID, epoch: Epoch | None = None) -> bool:
         """
         Check if a single node is ready in a single or any epoch
 
         Args:
             node (NodeID): the node to check
-            epoch (int | None): the epoch to check, if ``None`` , any epoch
+            epoch (Epoch | None): the epoch to check, if ``None`` , any epoch
         """
         # slight duplication of the above because we don't want to *get* the ready nodes,
         # which marks them as "out" in the TopoSorter
@@ -142,18 +296,15 @@ class Scheduler(BaseModel):
             return True
 
         graphs = self._epochs.items() if epoch is None else [(epoch, self[epoch])]
-        is_ready = any(node_id == node for epoch, graph in graphs for node_id in graph.ready_nodes)
+        is_ready = any(node_id == node for ep, graph in graphs for node_id in graph.ready_nodes)
         return is_ready
 
-    def __getitem__(self, epoch: int) -> TopoSorter:
-        if epoch == -1:
-            return self._epochs[max(self._epochs.keys())]
-
+    def __getitem__(self, epoch: Epoch) -> TopoSorter:
         if epoch not in self._epochs:
             self.add_epoch(epoch)
         return self._epochs[epoch]
 
-    def sources_finished(self, epoch: int | None = None) -> bool:
+    def sources_finished(self, epoch: Epoch | None = None) -> bool:
         """
         Check the source nodes of the given epoch have been processed.
         If epoch is None, check the source nodes of the latest epoch.
@@ -162,7 +313,14 @@ class Scheduler(BaseModel):
         if epoch is None and len(self._epochs) == 0:
             return True
 
-        graph = self[-1] if epoch is None else self._epochs[epoch]
+        if epoch is None:
+            # Get the most recent root epoch
+            root_epochs = [e for e in self._epochs.keys() if len(e) == 1]
+            if not root_epochs:
+                return True
+            epoch = max(root_epochs, key=lambda e: e[0][0])
+
+        graph = self._epochs[epoch]
         return all(src in graph.done_nodes for src in self.source_nodes)
 
     def update(
@@ -203,7 +361,7 @@ class Scheduler(BaseModel):
 
         return ret_events
 
-    def done(self, epoch: int, node_id: str) -> MetaEvent | None:
+    def done(self, epoch: Epoch, node_id: str) -> MetaEvent | None:
         """
         Mark a node in a given epoch as done.
 
@@ -227,11 +385,11 @@ class Scheduler(BaseModel):
                 self[epoch].done(node_id)
 
             self._ready_condition.notify_all()
-            if not self[epoch].is_active():
+            if not self.is_active(epoch):
                 return self.end_epoch(epoch)
         return None
 
-    def expire(self, epoch: int, node_id: str) -> MetaEvent | None:
+    def expire(self, epoch: Epoch, node_id: str) -> MetaEvent | None:
         """
         Mark a node as having been completed without making its dependent nodes ready.
         i.e. when the node emitted ``NoEvent``
@@ -239,18 +397,18 @@ class Scheduler(BaseModel):
         with self._ready_condition, self._epoch_condition:
             self[epoch].mark_expired(node_id)
             self._ready_condition.notify_all()
-            if not self[epoch].is_active():
+            if not self.is_active(epoch):
                 return self.end_epoch(epoch)
 
         return None
 
-    def await_node(self, node_id: NodeID, epoch: int | None = None) -> MetaEvent:
+    def await_node(self, node_id: NodeID, epoch: Epoch | None = None) -> MetaEvent:
         """
         Block until a node is ready
 
         Args:
             node_id:
-            epoch (int, None): if `int` , wait until the node is ready in the given epoch,
+            epoch (Epoch, None): if `Epoch` , wait until the node is ready in the given epoch,
                 otherwise wait until the node is ready in any epoch
 
         Returns:
@@ -287,20 +445,20 @@ class Scheduler(BaseModel):
             value=node_id,
         )
 
-    def await_epoch(self, epoch: int | None = None) -> int:
+    def await_epoch(self, epoch: Epoch | None = None) -> Epoch:
         """
         Block until an epoch is completed.
 
         Args:
-            epoch (int, None): if `int` , wait until the epoch is ready,
+            epoch (Epoch, None): if `Epoch` , wait until the epoch is ready,
                 otherwise wait until the next epoch is finished, in whatever order.
 
         Returns:
-            int: the epoch that was completed.
+            Epoch: the epoch that was completed.
         """
         with self._epoch_condition:
             # check if we have already completed this epoch
-            if isinstance(epoch, int) and self.epoch_completed(epoch):
+            if epoch is not None and self.epoch_completed(epoch):
                 return epoch
 
             if epoch is None:
@@ -310,7 +468,7 @@ class Scheduler(BaseModel):
                 self._epoch_condition.wait_for(lambda: self.epoch_completed(epoch))
                 return epoch
 
-    def epoch_completed(self, epoch: int) -> bool:
+    def epoch_completed(self, epoch: Epoch) -> bool:
         """
         Check if the epoch has been completed.
         """
@@ -321,8 +479,8 @@ class Scheduler(BaseModel):
             active_completed = epoch in self._epochs and not self._epochs[epoch].is_active()
             return previously_completed or active_completed
 
-    def end_epoch(self, epoch: int | None = None) -> MetaEvent | None:
-        if epoch is None or epoch == -1:
+    def end_epoch(self, epoch: Epoch | None = None) -> MetaEvent | None:
+        if epoch is None:
             if len(self._epochs) == 0:
                 return None
             epoch = list(self._epochs)[-1]
@@ -330,7 +488,11 @@ class Scheduler(BaseModel):
         with self._epoch_condition:
             self._epoch_condition.notify_all()
             self._epoch_log.append(epoch)
-            del self._epochs[epoch]
+            if epoch in self._epochs:
+                del self._epochs[epoch]
+
+            # Check if this was a sub-epoch and all siblings are now complete
+            self._check_subepoch_completion(epoch)
 
         return MetaEvent(
             id=uuid4().int,
@@ -340,6 +502,101 @@ class Scheduler(BaseModel):
             epoch=epoch,
             value=epoch,
         )
+
+    def _check_subepoch_completion(self, ended_epoch: Epoch) -> None:
+        """
+        When a sub-epoch ends, check if all sibling sub-epochs are complete.
+        If so, mark the map node as done in the parent epoch so downstream
+        nodes (like Return) become ready.
+        """
+        if len(ended_epoch) <= 1:
+            # Not a sub-epoch
+            return
+
+        parent_epoch = ended_epoch[:-1]
+        map_node_id = ended_epoch[-1][1]  # The node that created this sub-epoch
+
+        # Check if we have tracking info for this map
+        if parent_epoch not in self._subepoch_counts:
+            return
+        if map_node_id not in self._subepoch_counts[parent_epoch]:
+            return
+
+        expected_count = self._subepoch_counts[parent_epoch][map_node_id]
+
+        # Count how many sub-epochs for this map have completed
+        completed_count = sum(
+            1 for ep in self._epoch_log
+            if len(ep) > len(parent_epoch)
+            and ep[:len(parent_epoch)] == parent_epoch
+            and ep[len(parent_epoch)][1] == map_node_id
+        )
+
+        if completed_count >= expected_count:
+            # All sub-epochs complete - unblock ONLY sink successors in parent epoch
+            # Other successors already ran in sub-epochs
+            if parent_epoch in self._epochs:
+                self.logger.debug(
+                    "All %d sub-epochs for map %s complete, unblocking sink successors in parent %s",
+                    expected_count, map_node_id, parent_epoch
+                )
+                # Get nodes that were in sub-epochs (already processed)
+                # Stop at Gather nodes - their successors run in parent after gather
+                subepoch_nodes = self._get_subepoch_nodes(map_node_id)
+
+                graph = self[parent_epoch]
+
+                # Mark ALL non-map nodes that ran in sub-epochs as expired in parent
+                # This prevents them from running again in the parent epoch
+                # (the map node itself was already expired when it created sub-epochs)
+                # Note: Gather nodes will be marked done by their GatherResult handling,
+                # so we skip them here to avoid double-marking
+                for node in subepoch_nodes:
+                    if node != map_node_id and node not in graph.done_nodes:
+                        # Skip gather nodes - they're marked done by GatherResult handling
+                        if self.nodes[node].type_ != "gather":
+                            graph.mark_expired(node)
+
+                # Now unblock successors for ALL nodes that ran in sub-epochs
+                # This is needed for nested maps: when b's sub-epochs complete,
+                # Return depends on both b AND c. We need to unblock for both.
+                for node in subepoch_nodes:
+                    graph._unblock_successors(node)
+
+                self._ready_condition.notify_all()
+            else:
+                self.logger.debug(
+                    "All sub-epochs complete but parent epoch %s no longer active",
+                    parent_epoch
+                )
+
+            # Clean up tracking
+            self._subepoch_counts[parent_epoch].pop(map_node_id, None)
+            if not self._subepoch_counts[parent_epoch]:
+                del self._subepoch_counts[parent_epoch]
+
+    def collapse_subepochs(self, parent_epoch: Epoch, map_node_id: str) -> None:
+        """
+        End all sub-epochs created by a map node, returning to the parent epoch.
+
+        Called when a gather node collapses mapped events.
+        """
+        with self._ready_condition, self._epoch_condition:
+            to_end = [
+                ep
+                for ep in list(self._epochs.keys())
+                if len(ep) > len(parent_epoch)
+                and ep[: len(parent_epoch)] == parent_epoch
+                and ep[len(parent_epoch)][1] == map_node_id
+            ]
+            for ep in to_end:
+                self.end_epoch(ep)
+
+            # Clean up tracking
+            if parent_epoch in self._subepoch_counts:
+                self._subepoch_counts[parent_epoch].pop(map_node_id, None)
+                if not self._subepoch_counts[parent_epoch]:
+                    del self._subepoch_counts[parent_epoch]
 
     def enable_node(self, node_id: str) -> None:
         """
@@ -365,6 +622,7 @@ class Scheduler(BaseModel):
         """
         self._epochs = {}
         self._epoch_log = deque(maxlen=100)
+        self._subepoch_counts = {}
 
     @staticmethod
     def _init_graph(nodes: dict[str, NodeSpecification], edges: list[Edge]) -> TopoSorter:

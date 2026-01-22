@@ -5,6 +5,7 @@ Special Return sink that tube runners use to return values from :meth:`.TubeRunn
 from typing import Any
 
 from noob.event import MetaSignal
+from noob.logging import init_logger
 from noob.node.base import Node, Slot
 
 
@@ -15,11 +16,14 @@ class Return(Node):
 
     _args: tuple | None = None
     _kwargs: dict | None = None
+    _logger = init_logger("noob.node.return")
 
     def process(self, *args: Any, **kwargs: Any) -> MetaSignal:
         """
         Store the incoming value to retrieve later with :meth:`.get`
         """
+        self._logger.debug("Return.process called with args=%s, kwargs=%s", args, kwargs)
+
         if self._args is None:
             self._args = args
         else:
@@ -30,12 +34,14 @@ class Return(Node):
         else:
             self._kwargs.update(kwargs)
 
+        self._logger.debug("Return._kwargs now: %s", self._kwargs)
         return MetaSignal.NoEvent
 
     def get(self, keep: bool) -> Any | None:
         """
         Get the stored value from the process call, clearing it.
         """
+        self._logger.debug("Return.get called with keep=%s, _kwargs=%s", keep, self._kwargs)
         try:
             # FIXME: what a nightmare - make all of these derive from the spec
             if self._args and self.spec is not None and isinstance(self.spec.depends, str):
@@ -50,6 +56,7 @@ class Return(Node):
                 return None
         finally:
             if not keep:
+                self._logger.debug("Clearing Return._args and _kwargs")
                 self._args = None
                 self._kwargs = None
 

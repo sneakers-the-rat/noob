@@ -133,9 +133,9 @@ benchmark = "pytest tests/bench.py --codspeed"
 
 [tool.pytest.ini_options]
 addopts = [
-    "--cov=noob",
-    "--cov-append",
-    "--timeout=15",
+#    "--cov=noob",
+#    "--cov-append",
+    "--timeout=10",
 ]
 markers = [
     "async_runner: uses the async runner",

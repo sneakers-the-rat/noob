@@ -232,18 +232,33 @@ class TopoSorter:
             # Mark the node as processed
             self.mark_expired(node)
 
-            # Go to all the successors and reduce the number of predecessors,
-            # collecting all the ones that are ready to be returned in the next get_ready() call.
-            for successor in nodeinfo.successors:
-                if successor in self.done_nodes or successor in self.out_nodes:
-                    continue
-                successor_info = n2i[successor]
-                successor_info.nqueue -= 1
-                if successor_info.nqueue == 0:
-                    if successor in self._disabled_nodes:
-                        self.mark_expired(successor)
-                    else:
-                        self.mark_ready(successor)
+            self._unblock_successors(node)
+
+    def _unblock_successors(self, node: str) -> None:
+        """
+        Unblock successors of a node by decrementing their predecessor counts.
+
+        This is the second part of done() - making successors ready.
+        Separated to allow triggering successors for nodes that were
+        previously expired (like map nodes after sub-epochs complete).
+        """
+        n2i = self._node2info
+        nodeinfo = n2i.get(node)
+        if nodeinfo is None:
+            return
+
+        # Go to all the successors and reduce the number of predecessors,
+        # collecting all the ones that are ready to be returned in the next get_ready() call.
+        for successor in nodeinfo.successors:
+            if successor in self.done_nodes or successor in self.out_nodes:
+                continue
+            successor_info = n2i[successor]
+            successor_info.nqueue -= 1
+            if successor_info.nqueue == 0:
+                if successor in self._disabled_nodes:
+                    self.mark_expired(successor)
+                else:
+                    self.mark_ready(successor)
 
     def find_cycle(self) -> list[str] | None:
         n2i = self._node2info
