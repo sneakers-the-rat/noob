@@ -1,6 +1,8 @@
+import base64
 import concurrent.futures
 import math
 import multiprocessing as mp
+import pickle
 import threading
 from collections.abc import Generator, MutableSequence
 from dataclasses import dataclass, field
@@ -10,6 +12,7 @@ from time import time
 from typing import Any, cast, overload
 from uuid import uuid4
 
+from noob.asset import AssetScope
 from noob.event import Event, MetaEvent, MetaEventType, MetaSignal
 from noob.exceptions import InputMissingError
 from noob.input import InputScope
@@ -64,6 +67,8 @@ class ZMQRunner(TubeRunner):
             return
         with self._init_lock:
             self._logger.debug("Initializing ZMQ runner")
+            self.tube.state.init(AssetScope.runner)
+            asset_sources = self._compute_asset_sources()
             self.command = CommandNode(runner_id=self.runner_id)
             threading.Thread(target=self.command.run, daemon=True).start()
             self.command._init.wait()
@@ -84,6 +89,7 @@ class ZMQRunner(TubeRunner):
                         "command_outbox": self.command.pub_address,
                         "command_router": self.command.router_address,
                         "input_collection": self.tube.input_collection,
+                        "asset_sources": asset_sources.get(node_id, {}),
                     },
                     name=".".join([self.runner_id, node_id]),
                     daemon=True,
@@ -134,10 +140,64 @@ class ZMQRunner(TubeRunner):
                         f"NodeRunner {proc.name} still not closed! making an unclean exit."
                     )
 
+            self.tube.state.deinit(AssetScope.runner)
             self.command.clear_callbacks()
             self.command.deinit()
             self.tube.scheduler.clear()
             self._initialized.clear()
+
+    def _compute_asset_sources(self) -> dict[NodeID, dict[str, str | None]]:
+        """
+        For each non-node-scoped asset, compute the chain of nodes that use it
+        in topological order. The first user gets the value from ProcessMsg (source=None),
+        subsequent users get the mutated value from the preceding node via synthetic event.
+
+        Returns:
+            {node_id: {asset_id: source_node_or_none}}
+        """
+        generations = self.tube.scheduler.generations()
+
+        # For each node, find which non-node-scoped assets it depends on
+        node_asset_deps: dict[str, set[str]] = {}
+        for node_id, node in self.tube.nodes.items():
+            if isinstance(node, Return):
+                continue
+            for edge in node.edges:
+                if (
+                    edge.source_node == "assets"
+                    and edge.source_signal is not None
+                    and edge.source_signal in self.tube.state.specs
+                    and self.tube.state.specs[edge.source_signal].scope != AssetScope.node
+                ):
+                    node_asset_deps.setdefault(node_id, set()).add(edge.source_signal)
+
+        # Order nodes per asset by topological generation
+        asset_node_order: dict[str, list[str]] = {}
+        for gen in generations:
+            for node_id in gen:
+                if node_id in node_asset_deps:
+                    for asset_id in node_asset_deps[node_id]:
+                        asset_node_order.setdefault(asset_id, []).append(node_id)
+
+        # Build asset_sources for each node
+        all_asset_sources: dict[str, dict[str, str | None]] = {}
+        for asset_id, ordered_nodes in asset_node_order.items():
+            for i, node_id in enumerate(ordered_nodes):
+                all_asset_sources.setdefault(node_id, {})[asset_id] = (
+                    ordered_nodes[i - 1] if i > 0 else None
+                )
+
+        return all_asset_sources
+
+    def _collect_assets(self) -> str | None:
+        """Collect all non-node-scoped asset values, pickle+base64 encode for ProcessMsg."""
+        assets: dict[str, Any] = {}
+        for asset_id, asset in self.tube.state.assets.items():
+            if asset.scope != AssetScope.node:
+                assets[asset_id] = asset.obj
+        if not assets:
+            return None
+        return base64.b64encode(pickle.dumps(assets)).decode("utf-8")
 
     def process(self, **kwargs: Any) -> ReturnNodeType:
         if not self.initialized:
@@ -148,6 +208,7 @@ class ZMQRunner(TubeRunner):
                 "Runner is already running in free run mode! use iter to gather results"
             )
         input = self.tube.input_collection.validate_input(InputScope.process, kwargs)
+        self.tube.state.init(AssetScope.process)
         self._running.set()
         try:
             self._current_epoch = self.tube.scheduler.add_epoch()
@@ -156,14 +217,18 @@ class ZMQRunner(TubeRunner):
             # so we can't check presence of inputs in the input collection
             if "input" in self.tube.scheduler._epochs[self._current_epoch].ready_nodes:
                 self.tube.scheduler.done(self._current_epoch, "input")
+            if "assets" in self.tube.scheduler._epochs[self._current_epoch].ready_nodes:
+                self.tube.scheduler.done(self._current_epoch, "assets")
+            assets = self._collect_assets()
             self.command = cast(CommandNode, self.command)
-            self.command.process(self._current_epoch, input)
+            self.command.process(self._current_epoch, input, assets=assets)
             self._logger.debug("awaiting epoch %s", self._current_epoch)
             self.await_epoch(self._current_epoch)
             self._logger.debug("collecting return")
 
             return self.collect_return(self._current_epoch)
         finally:
+            self.tube.state.deinit(AssetScope.process)
             self._running.clear()
 
     def iter(self, n: int | None = None) -> Generator[ReturnNodeType, None, None]:
@@ -307,17 +372,37 @@ class ZMQRunner(TubeRunner):
             return
 
         msg = cast(EventMsg, msg)
+        # Separate synthetic asset events from real events
+        real_events = []
+        for e in msg.value:
+            signal = str(e["signal"])
+            if signal.startswith("__asset__"):
+                # Update runner-scoped assets with mutated values from NodeRunners
+                asset_id = signal[len("__asset__"):]
+                if (
+                    asset_id in self.tube.state.assets
+                    and self.tube.state.assets[asset_id].scope == AssetScope.runner
+                ):
+                    asset_value = pickle.loads(base64.b64decode(e["value"]))
+                    self.tube.state.assets[asset_id].obj = asset_value
+            else:
+                real_events.append(e)
+        if not real_events:
+            return
         # store events (if we are not in freerun mode, where we don't want to store infinite events)
         if not self._ignore_events:
-            for event in msg.value:
+            for event in real_events:
                 self.store.add(event)
-        events = self.tube.scheduler.update(msg.value)
+        # Update state for runner-scoped asset depends
+        if self.tube.state.dependencies:
+            self.tube.state.update(real_events)
+        events = self.tube.scheduler.update(real_events)
         events = cast(MutableSequence[Event | MetaEvent], events)
         if self._return_node is not None:
             # mark the return node done if we've received the expected events for an epoch
             # do it here since we don't really run the return node like a real node
             # to avoid an unnecessary pickling/unpickling across the network
-            epochs = set(e["epoch"] for e in msg.value)
+            epochs = set(e["epoch"] for e in real_events)
             for epoch in epochs:
                 ready_epochs = self.tube.scheduler.get_ready(epoch, self._return_node.id)
                 for ready in ready_epochs:

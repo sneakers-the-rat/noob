@@ -5,7 +5,7 @@ import builtins
 import pickle
 import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from os import PathLike
@@ -100,6 +100,9 @@ def _to_isoformat(val: datetime) -> str:
 
 
 def _to_jsonable_pickle(val: Any, handler: SerializerFunctionWrapHandler) -> Any:
+    # Iterators/generators would be consumed (potentially infinitely) by the handler
+    if isinstance(val, Iterator):
+        return "pck__" + base64.b64encode(pickle.dumps(val)).decode("utf-8")
     try:
         return handler(val)
     except (TypeError, PydanticSerializationError):

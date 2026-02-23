@@ -140,8 +140,8 @@ benchmark = "pytest tests/bench.py --codspeed --timeout=15"
 
 [tool.pytest.ini_options]
 addopts = [
-    "--cov=noob",
-    "--cov-append",
+#    "--cov=noob",
+#    "--cov-append",
     "--timeout=10",
 ]
 markers = [

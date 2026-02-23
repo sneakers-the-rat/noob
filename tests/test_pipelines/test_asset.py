@@ -10,33 +10,35 @@ pytestmark = pytest.mark.assets
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("loaded_tube", ["testing-runner-asset"], indirect=True)
-async def test_runner_scoped(local_runner, loaded_tube):
+async def test_runner_scoped(all_runners, loaded_tube):
     """
     'runner' scoped assets are persistent across process calls
     """
+    runner = all_runners
     for i in range(5):
-        if iscoroutinefunction_partial(local_runner.process):
-            await local_runner.process()
+        if iscoroutinefunction_partial(runner.process):
+            await runner.process()
         else:
-            local_runner.process()
-        store = local_runner.store.events[Epoch(i)]
+            runner.process()
+        store = runner.store.events[Epoch(i)]
         assert store["increment"]["next"][0]["value"] == 2 ** (i + 1) - 1
         assert store["more_increment"]["next"][0]["value"] == 2 * (2 ** (i + 1) - 1)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("loaded_tube", ["testing-process-asset"], indirect=True)
-async def test_process_scoped(local_runner, loaded_tube):
+async def test_process_scoped(all_runners, loaded_tube):
     """
     'process' scoped assets are recreated every process call.
     However, a given asset is shared by nodes within a single process call.
     """
+    runner = all_runners
     for i in range(5):
-        if iscoroutinefunction_partial(local_runner.process):
-            await local_runner.process()
+        if iscoroutinefunction_partial(runner.process):
+            await runner.process()
         else:
-            local_runner.process()
-        store = local_runner.store.events[Epoch(i)]
+            runner.process()
+        store = runner.store.events[Epoch(i)]
         assert store["increment"]["next"][0]["value"] == 3  # renewed each process call
         assert store["more_increment"]["next"][0]["value"] == 6  # but shared among nodes
 
@@ -107,7 +109,9 @@ async def test_asset_copy_post_depends(loaded_tube, all_runners):
         assert result["post_value"] == start + 2
 
         # within the epoch, the generator should be unchanged and passed between nodes
-        assert id(result["a_iterator"]) == id(result["b_iterator"]) == id(result["post_iterator"])
+        # (in ZMQ runners, objects cross process boundaries via pickle, so id equality is relaxed)
+        if not hasattr(runner, "node_procs"):
+            assert id(result["a_iterator"]) == id(result["b_iterator"]) == id(result["post_iterator"])
 
 
 def test_asset_nocopy_when_unused():

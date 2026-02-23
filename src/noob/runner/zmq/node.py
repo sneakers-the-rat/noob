@@ -1,15 +1,19 @@
 import asyncio
+import base64
 import concurrent.futures
 import multiprocessing as mp
 import os
+import pickle
 import signal
 import traceback
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import AsyncGenerator
 from functools import partial
 from itertools import count
 from types import FrameType
+from datetime import UTC, datetime
 from typing import Any, cast
+from uuid import uuid4
 
 import zmq
 from pydantic import ValidationError
@@ -60,7 +64,8 @@ class NodeRunner(EventloopMixin):
         command_outbox: str,
         command_router: str,
         input_collection: InputCollection,
-        asset_specs: dict[str, AssetSpecification],
+        asset_specs: dict[str, AssetSpecification] | None = None,
+        asset_sources: dict[str, str | None] | None = None,
         protocol: str = "ipc",
     ):
         self.spec = spec
@@ -70,7 +75,8 @@ class NodeRunner(EventloopMixin):
         self.command_router = command_router
         self.protocol = protocol
         self.store = EventStore()
-        self.asset_specs = asset_specs
+        self.asset_specs = asset_specs or {}
+        self.asset_sources: dict[str, str | None] = asset_sources or {}
         self.state: State = None  # type: ignore[assignment]
         self.scheduler: Scheduler = None  # type: ignore[assignment]
         self.logger = init_logger(f"runner.node.{runner_id}.{self.spec.id}")
@@ -86,6 +92,10 @@ class NodeRunner(EventloopMixin):
         self._status: NodeStatus = NodeStatus.stopped
         self._status_lock = asyncio.Lock()
         self._ready_condition = asyncio.Condition()
+        # Asset tracking for non-node-scoped assets
+        self._expected_assets: set[str] = set()
+        self._received_assets: dict[Epoch, set[str]] = defaultdict(set)
+        self._asset_target_slots: dict[str, str] = {}
         super().__init__()
         self._quitting = asyncio.Event()
 
@@ -157,6 +167,7 @@ class NodeRunner(EventloopMixin):
         except KeyboardInterrupt:
             self.logger.debug("Got keyboard interrupt, quitting")
         except Exception as e:
+            self.logger.exception("Exception in _run: %s", e)
             await self.error(e)
         finally:
             await self.deinit()
@@ -177,6 +188,20 @@ class NodeRunner(EventloopMixin):
                     part = partial(self._node.process, *args, **kwargs)
                     value = await loop.run_in_executor(executor, part)
                 events = self.store.add_value(self._node.signals, value, self._node.id, epoch)
+                # Build synthetic asset events for mutated shared assets
+                synthetic_events = []
+                for asset_id, target_slot in self._asset_target_slots.items():
+                    mutated_value = kwargs[target_slot]
+                    synthetic_events.append(
+                        Event(
+                            id=uuid4().int,
+                            timestamp=datetime.now(UTC),
+                            node_id=self.spec.id,
+                            signal=f"__asset__{asset_id}",
+                            value=base64.b64encode(pickle.dumps(mutated_value)).decode("utf-8"),
+                            epoch=epoch,
+                        )
+                    )
                 async with self._ready_condition:
                     self.scheduler.add_epoch()
 
@@ -184,7 +209,11 @@ class NodeRunner(EventloopMixin):
                     events = [e for e in events if e["node_id"] != "meta"]
                     if events:
                         self.scheduler.update(events)
-                        await self.publish_events(events)
+                    all_events = events + synthetic_events
+                    self.logger.debug("About to publish %d events for epoch %s", len(all_events), epoch)
+                    if all_events:
+                        await self.publish_events(all_events)
+                    self.logger.debug("Published events, notifying")
                     self._ready_condition.notify_all()
 
     async def await_inputs(self) -> AsyncGenerator[tuple[tuple[Any], dict[str, Any], Epoch]]:
@@ -268,11 +297,21 @@ class NodeRunner(EventloopMixin):
             if self.scheduler.epoch_completed(epoch):
                 self.logger.debug("Epoch completed: %s", epoch)
                 self.store.clear(epoch)
+                self._received_assets.pop(epoch, None)
                 epoch = None
 
     async def publish_events(self, events: list[Event]) -> None:
-        msg = EventMsg(node_id=self.spec.id, value=events)
-        await self.sockets["outbox"].send_multipart([b"event", msg.to_bytes()])
+        self.logger.debug("Constructing EventMsg with %d events", len(events))
+        try:
+            msg = EventMsg(node_id=self.spec.id, value=events)
+        except Exception as e:
+            self.logger.exception("FAILED to construct EventMsg: %s", e)
+            raise
+        self.logger.debug("EventMsg constructed, calling to_bytes")
+        payload = msg.to_bytes()
+        self.logger.debug("Serialized %d bytes, sending on outbox", len(payload))
+        await self.sockets["outbox"].send_multipart([b"event", payload])
+        self.logger.debug("Sent on outbox")
 
     async def init(self) -> None:
         self.logger.debug("Initializing")
@@ -281,7 +320,7 @@ class NodeRunner(EventloopMixin):
         self._quitting.clear()
         self.status = (
             NodeStatus.waiting
-            if self.depends and [d for d in self.depends if d[0] != "input"]
+            if self.depends and [d for d in self.depends if d[0] not in ("input", "assets")]
             else NodeStatus.ready
         )
         await self.identify()
@@ -362,6 +401,12 @@ class NodeRunner(EventloopMixin):
             ],
             logger=init_logger(f"noob.scheduler.{self.spec.id}"),
         )
+        # Track non-node-scoped assets this node depends on
+        self._expected_assets = set(self.asset_sources.keys())
+        self._asset_target_slots = {}
+        for edge in self._node.edges:
+            if edge.source_node == "assets" and edge.source_signal in self.asset_sources:
+                self._asset_target_slots[edge.source_signal] = edge.target_slot
         async with self._ready_condition:
             self.scheduler.add_epoch()
             self._ready_condition.notify_all()
@@ -438,7 +483,9 @@ class NodeRunner(EventloopMixin):
         self._node = cast(Node, self._node)
         self.logger.debug("Processing announce")
 
-        depended_nodes = {edge.source_node for edge in self._node.edges}
+        # Include asset source nodes (preceding users of shared assets)
+        asset_source_nodes = {v for v in self.asset_sources.values() if v is not None}
+        depended_nodes = {edge.source_node for edge in self._node.edges} | asset_source_nodes
         if depended_nodes:
             self.logger.debug("Should subscribe to %s", depended_nodes)
         for node_id in msg.value["nodes"]:
@@ -449,7 +496,7 @@ class NodeRunner(EventloopMixin):
                 self.sockets["inbox"].connect(outbox)
                 self.logger.debug("Subscribed to %s at %s", node_id, outbox)
         self._nodes = msg.value["nodes"]
-        if set(self._nodes) >= depended_nodes - {"input"} and self.status == NodeStatus.waiting:
+        if set(self._nodes) >= depended_nodes - {"input", "assets"} and self.status == NodeStatus.waiting:
             await self.update_status(NodeStatus.ready)
         # status and announce messages can be received out of order,
         # so if we observe the command node being out of sync, we update it.
@@ -462,15 +509,58 @@ class NodeRunner(EventloopMixin):
     async def on_event(self, msg: EventMsg) -> None:
         self.logger.debug("RECEIVED EVENTS: %s", msg.value)
         events = msg.value
-        if not self.depends:
-            self.logger.debug("No dependencies, not storing events")
+
+        # Separate synthetic asset events from real events
+        real_events = []
+        asset_epochs_updated: set[Epoch] = set()
+        for e in events:
+            signal = str(e["signal"])
+            if signal.startswith("__asset__"):
+                asset_id = signal[len("__asset__"):]
+                source_node = e["node_id"]
+                if (
+                    asset_id in self.asset_sources
+                    and self.asset_sources[asset_id] == source_node
+                ):
+                    # Transform to asset event and store in EventStore
+                    asset_value = pickle.loads(base64.b64decode(e["value"]))
+                    asset_event = Event(
+                        id=uuid4().int,
+                        timestamp=datetime.now(UTC),
+                        node_id="assets",
+                        signal=asset_id,
+                        value=asset_value,
+                        epoch=e["epoch"],
+                    )
+                    self.store.add(asset_event)
+                    self._received_assets[e["epoch"]].add(asset_id)
+                    asset_epochs_updated.add(e["epoch"])
+            else:
+                real_events.append(e)
+
+        if not self.depends and not asset_epochs_updated:
+            self.logger.debug("No dependencies and no asset events, not storing")
             return
 
-        to_add = [e for e in events if (e["node_id"], e["signal"]) in self.depends]
-        for event in to_add:
-            self.store.add(event)
+        to_add = []
+        if self.depends:
+            to_add = [e for e in real_events if (e["node_id"], e["signal"]) in self.depends]
+            for event in to_add:
+                self.store.add(event)
+
         async with self._ready_condition:
-            self.scheduler.update(events)
+            # Mark "assets" done if all expected assets received for updated epochs
+            for epoch in asset_epochs_updated:
+                if self._received_assets[epoch] >= self._expected_assets:
+                    self.logger.debug("Marking assets done for epoch %s", epoch)
+                    self.scheduler.done(epoch, "assets")
+            if to_add:
+                self.logger.debug("Updating scheduler with %d events", len(to_add))
+                self.scheduler.update(to_add)
+            self.logger.debug(
+                "on_event done, node ready: %s",
+                self.scheduler.node_is_ready(self.spec.id),
+            )
             self._ready_condition.notify_all()
 
     async def on_start(self, msg: StartMsg) -> None:
@@ -518,6 +608,27 @@ class NodeRunner(EventloopMixin):
                 scheduler_events = self.scheduler.update(events)
                 self._ready_condition.notify_all()
                 self.logger.debug("Updated scheduler with process events: %s", scheduler_events)
+
+        # Handle assets from ProcessMsg (for first-user nodes)
+        if self._expected_assets and msg.value.get("assets"):
+            epoch = msg.value["epoch"]
+            assets_dict = pickle.loads(base64.b64decode(msg.value["assets"]))
+            for asset_id in self._expected_assets:
+                if self.asset_sources.get(asset_id) is None and asset_id in assets_dict:
+                    asset_event = Event(
+                        id=uuid4().int,
+                        timestamp=datetime.now(UTC),
+                        node_id="assets",
+                        signal=asset_id,
+                        value=assets_dict[asset_id],
+                        epoch=epoch,
+                    )
+                    self.store.add(asset_event)
+                    self._received_assets[epoch].add(asset_id)
+            if self._received_assets[epoch] >= self._expected_assets:
+                async with self._ready_condition:
+                    self.scheduler.done(epoch, "assets")
+                    self._ready_condition.notify_all()
 
         self._process_one.set()
 

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(find:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(pdm run test:*)",
+      "Bash(tee:*)"
+    ]
+  }
+}

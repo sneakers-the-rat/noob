@@ -164,7 +164,7 @@ class CommandNode(EventloopMixin):
         )
         self.logger.debug("Sent start message")
 
-    def process(self, epoch: Epoch, input: dict | None = None, assets: dict | None = None) -> None:
+    def process(self, epoch: Epoch, input: dict | None = None, assets: str | None = None) -> None:
         """Emit a ProcessMsg to process a single round through the graph"""
         # no empty dicts
         input = input if input else None
