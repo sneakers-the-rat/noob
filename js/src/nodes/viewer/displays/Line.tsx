@@ -1,26 +1,27 @@
 /**
- * Line plot via vega-embed.
+ * Line display — oscilloscope-style trail via vega-embed.
  *
- * Behavior:
- *  - If only ``yRecords`` is supplied: x is the event id (monotonically
- *    increasing integer), y is the numeric value.
- *  - If ``xRecords`` is also supplied: pair records by epoch and plot y vs x
- *    (Lissajous mode).
+ * Two handles. The ``in`` handle is required (treated as the y series).
+ * The ``x`` handle is optional:
+ *  - If unconnected: x is the event id (monotonically increasing integer).
+ *  - If connected: pair x and y records by epoch and plot y vs x (Lissajous).
  *
- * Style is oscilloscope-flavored: the line is a ``trail`` mark whose color,
- * width and opacity all decay with age so the most recent stretch is bright
- * and fat and old segments fade into the background.
+ * The trail's color, width and opacity all decay with age so newer
+ * segments are bright and fat and old segments fade.
  *
- * The vega view is created exactly once per mount. Data is streamed via
- * ``view.change()``; when the structural mode flips (X gets connected /
- * disconnected) we clear the existing data and reset the cursor so the
- * trail restarts cleanly in the new coordinate system.
+ * The vega view is created once per mount. When the structural mode flips
+ * (x getting connected or disconnected) we wipe the data and reset the
+ * cursor so the trail doesn't draw across the coordinate-system change.
+ *
+ * In test mode (`window.__noobTest`), the live view is published to the
+ * harness so tests can `view.data("values")` to assert the data made it in.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import embed, { type Result, type VisualizationSpec } from "vega-embed";
-import type { ValueRecord } from "../protocol.ts";
-import { numericFromEnvelope } from "./decode.ts";
+import { numericFromEnvelope } from "../../../run/displays/decode.ts";
+import type { ValueRecord } from "../../../run/protocol.ts";
+import type { DisplayHandle, DisplayProps } from "./types.ts";
 
 const MAX_POINTS = 500;
 
@@ -28,6 +29,17 @@ interface Point {
   id: number;
   x: number;
   y: number;
+}
+
+export const handles: DisplayHandle[] = [
+  { id: "in", label: "y" },
+  { id: "x", label: "x" },
+];
+export const shortLabel = "LINE";
+export const title = "line plot";
+
+export function canRender(rec: ValueRecord | undefined): boolean {
+  return rec ? numericFromEnvelope(rec) !== null : false;
 }
 
 function epochKey(epoch: [string, number][]): string {
@@ -43,7 +55,12 @@ function buildSpec(): VisualizationSpec {
     background: "transparent",
     padding: 6,
     data: { name: "values", values: [] as Point[] },
-    mark: { type: "trail", interpolate: "linear" },
+    mark: {
+      type: "line",
+      stroke: "#9bff7a",
+      strokeWidth: 2,
+      interpolate: "linear",
+    },
     encoding: {
       x: {
         field: "x",
@@ -56,24 +73,6 @@ function buildSpec(): VisualizationSpec {
         axis: { title: null, labelFontSize: 8 },
       },
       order: { field: "id", type: "quantitative" },
-      size: {
-        field: "id",
-        type: "quantitative",
-        scale: { type: "linear", range: [0, 4] },
-        legend: null,
-      },
-      color: {
-        field: "id",
-        type: "quantitative",
-        scale: { type: "linear", range: ["#1a4a1a", "#9bff7a"] },
-        legend: null,
-      },
-      opacity: {
-        field: "id",
-        type: "quantitative",
-        scale: { type: "linear", range: [0.05, 1] },
-        legend: null,
-      },
     },
     config: {
       axis: {
@@ -86,25 +85,27 @@ function buildSpec(): VisualizationSpec {
   };
 }
 
-export function LinePlot({
-  yRecords,
-  xRecords,
-}: {
-  yRecords: ValueRecord[];
-  xRecords?: ValueRecord[];
-}) {
+export default function LineDisplay({ records }: DisplayProps) {
+  const yRecords = records.in ?? [];
+  const xRecords = records.x ?? [];
+
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<Result["view"] | null>(null);
   const lastIdRef = useRef<number>(Number.NEGATIVE_INFINITY);
   const [ready, setReady] = useState(false);
 
-  const isLissajous = (xRecords?.length ?? 0) > 0;
+  const isLissajous = xRecords.length > 0;
 
-  // Embed once. Container sizing handles resize via vega's own ResizeObserver.
+  // Embed once on mount. vega-embed has its own autoResize when both
+  // dimensions are "container", but we observe the container ourselves and
+  // call view.resize() — vega's built-in observer didn't fire reliably for
+  // our flexbox-sized container during xyflow NodeResizer drags.
   useEffect(() => {
     if (!containerRef.current) return;
+    const container = containerRef.current;
     let cancelled = false;
-    embed(containerRef.current, buildSpec(), {
+    let observer: ResizeObserver | null = null;
+    embed(container, buildSpec(), {
       actions: false,
       renderer: "canvas",
     })
@@ -115,21 +116,31 @@ export function LinePlot({
         }
         viewRef.current = result.view;
         setReady(true);
+        observer = new ResizeObserver(() => {
+          result.view
+            .signal("width", container.clientWidth)
+            .signal("height", container.clientHeight)
+            .resize()
+            .runAsync();
+        });
+        observer.observe(container);
+        const w = window as unknown as { __noobTest?: { _registerView?: (v: Result["view"]) => void } };
+        if (w.__noobTest?._registerView) w.__noobTest._registerView(result.view);
       })
       .catch((err) => {
-        // surface vega-embed errors instead of swallowing them silently
         console.error("[noob] vega embed failed", err);
       });
     return () => {
       cancelled = true;
+      observer?.disconnect();
       viewRef.current?.finalize();
       viewRef.current = null;
       setReady(false);
     };
   }, []);
 
-  // When the structural mode flips, wipe the view and reset the cursor so
-  // the trail doesn't draw across the coordinate-system change.
+  // Wipe data when the coordinate system flips, so a y-vs-id trail doesn't
+  // continue into a y-vs-x Lissajous (or vice versa).
   const prevModeRef = useRef(isLissajous);
   useEffect(() => {
     if (!ready) return;
@@ -143,7 +154,6 @@ export function LinePlot({
     prevModeRef.current = isLissajous;
   }, [ready, isLissajous]);
 
-  // Compute points for the current records / mode.
   const points = useMemo<Point[]>(() => {
     if (!isLissajous) {
       const out: Point[] = [];
@@ -155,7 +165,7 @@ export function LinePlot({
       return out;
     }
     const xByEpoch = new Map<string, ValueRecord>();
-    for (const r of xRecords ?? []) xByEpoch.set(epochKey(r.epoch), r);
+    for (const r of xRecords) xByEpoch.set(epochKey(r.epoch), r);
     const out: Point[] = [];
     for (const yr of yRecords) {
       const xr = xByEpoch.get(epochKey(yr.epoch));
@@ -168,9 +178,6 @@ export function LinePlot({
     return out;
   }, [yRecords, xRecords, isLissajous]);
 
-  // Insert newly-seen points, evict anything older than MAX_POINTS behind
-  // the newest. Runs when records change OR when the view first becomes
-  // ready (so initial data isn't dropped during the async embed).
   useEffect(() => {
     if (!ready) return;
     const view = viewRef.current;
@@ -197,12 +204,9 @@ export function LinePlot({
   return (
     <div
       ref={containerRef}
-      className="runner-display-lineplot"
+      className="viewer-line-plot"
+      data-testid="line-plot-container"
       style={{ width: "100%", height: "100%" }}
     />
   );
-}
-
-export function canRenderLine(rec: ValueRecord | undefined): boolean {
-  return rec ? numericFromEnvelope(rec) !== null : false;
 }

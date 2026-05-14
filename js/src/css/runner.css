@@ -175,7 +175,11 @@
     0 4px 12px rgba(0, 0, 0, 0.35);
   font-family: var(--font-body);
   color: var(--color-text);
-  overflow: hidden;
+  /* overflow stays *visible* so the NodeResizer's corner handles render
+     fully outside the chassis — `overflow: hidden` clipped them to
+     unreachable slivers. The screen has its own overflow:hidden to keep
+     plot contents inside. */
+  overflow: visible;
 }
 
 /*
@@ -353,12 +357,43 @@
   opacity: 1;
 }
 
+/*
+ * Corner resize handles: large invisible hit zone, small visible dot.
+ *
+ * The handle element itself is 18×18 (transparent) so the click target is
+ * generous, and a pseudo-element draws a 6px dot at the centre that sits
+ * flush with the chassis's rounded corner. On hover the visible dot grows
+ * a little for affordance.
+ */
 .viewer-resize-handle {
-  background: var(--color-primary) !important;
-  border: 2px solid var(--color-background) !important;
-  border-radius: 50% !important;
-  width: 14px !important;
-  height: 14px !important;
+  background: transparent !important;
+  border: none !important;
+  width: 18px !important;
+  height: 18px !important;
+  box-shadow: none !important;
+}
+.viewer-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  background: var(--color-primary);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  transition:
+    width 100ms ease,
+    height 100ms ease,
+    box-shadow 100ms ease;
+}
+.viewer-resize-handle:hover::after {
+  width: 10px;
+  height: 10px;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 6px color-mix(in srgb, var(--color-primary) 65%, transparent);
 }
 
 /* Dash the viewer node's border while hovering ANY resize control on it,

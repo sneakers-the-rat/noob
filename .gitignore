@@ -210,3 +210,7 @@ noob_config.yml
 prof/
 packages/**/pylock.toml
 packages/noob/src/noob/_js
+
+.vitest-attachments
+screenshots
+__screenshots__

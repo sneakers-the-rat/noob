@@ -1,19 +1,25 @@
 /**
- * Render the latest ndarray-as-image on a canvas.
- *
- * Same component handles both "image" and "video" modes — the only
- * difference is how often it repaints. With xyflow already re-rendering
- * the component each time `records` grows, we just always repaint the
- * latest record's image.
+ * Image display — paint the latest ndarray onto a canvas.
  */
 
 import { useEffect, useRef } from "react";
-import { decodeImage } from "./decode.ts";
-import type { ValueRecord, ValueEnvelope } from "../protocol.ts";
+import { decodeImage } from "../../../run/displays/decode.ts";
+import type { ValueRecord, ValueEnvelope } from "../../../run/protocol.ts";
+import type { DisplayHandle, DisplayProps } from "./types.ts";
 
-export function ImageDisplay({ records }: { records: ValueRecord[] }) {
+export const handles: DisplayHandle[] = [{ id: "in", label: "" }];
+export const shortLabel = "IMG";
+export const title = "image";
+
+export function canRender(rec: ValueRecord | undefined): boolean {
+  if (!rec) return false;
+  return decodeImage(rec) !== null;
+}
+
+export default function ImageDisplay({ records }: DisplayProps) {
+  const recs = records.in ?? [];
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const latest = records[records.length - 1];
+  const latest = recs.length ? recs[recs.length - 1] : undefined;
 
   useEffect(() => {
     if (!latest) return;
@@ -51,9 +57,4 @@ function describe(v: ValueEnvelope): string {
   if (v.kind === "ndarray")
     return `shape=${JSON.stringify(v.shape)} dtype=${v.dtype}`;
   return v.kind;
-}
-
-export function canRenderImage(rec: ValueRecord | undefined): boolean {
-  if (!rec) return false;
-  return decodeImage(rec) !== null;
 }

@@ -15,7 +15,9 @@
     "lint:fix": "npm run lint -- --fix",
     "format": "prettier -w .",
     "format:check": "prettier -c .",
-    "test": "vitest"
+    "test": "vitest",
+    "test:browser": "vitest --project=browser",
+    "test:browser:screenshots": "SCREENSHOT=1 vitest --project=browser"
   },
   "dependencies": {
     "@xyflow/react": "^12.10.0",
@@ -34,7 +36,9 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/browser-playwright": "^4.1.6",
     "@vitest/eslint-plugin": "^1.6.16",
     "babel-plugin-react-compiler": "^1.0.0",
     "eslint": "^9.39.1",
@@ -47,6 +51,8 @@
     "typescript-eslint": "^8.46.4",
     "vite": "^8",
     "vitest": "^4.1.5",
-    "web-worker": "^1.5.0"
+    "vitest-browser-react": "^2.2.0",
+    "web-worker": "^1.5.0",
+    "ws": "^8.20.1"
   }
 }

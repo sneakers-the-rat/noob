@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>noob-js test harness</title>
+    <link rel="stylesheet" type="text/css" href="/src/css/index.css" />
+  </head>
+  <body>
+    <div id="root" style="position: absolute; inset: 0;"></div>
+    <script type="module">
+      import { initView } from "/src/main.tsx";
+      const params = new URLSearchParams(location.search);
+      const tube_id = params.get("tube_id") || "test-tube";
+      window.addEventListener("load", () => initView("#root", tube_id, "dark"));
+    </script>
+  </body>
+</html>

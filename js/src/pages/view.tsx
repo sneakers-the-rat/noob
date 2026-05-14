@@ -21,7 +21,7 @@ import { tubeToFlow } from "../tube.tsx";
 import useLayoutNodes from "../useLayoutNodes.tsx";
 import ElkNode from "../nodes/elk.tsx";
 import TitleNode from "../nodes/title.tsx";
-import ViewerNode from "../nodes/viewer.tsx";
+import ViewerNode from "../nodes/viewer/index.tsx";
 import { InputEdge, ReturnEdge } from "../edge.tsx";
 import { RunProvider } from "../run/RunContext.tsx";
 import { Toolbar } from "../run/Toolbar.tsx";
@@ -71,10 +71,14 @@ function makeViewerNode(position: { x: number; y: number }): ViewerNodeType {
  *  - "viewer" nodes and the edges that connect them to signal handles, owned
  *    by the GUI and preserved across spec updates.
  */
+type MenuState =
+  | { kind: "pane"; x: number; y: number }
+  | { kind: "edge"; x: number; y: number; edgeId: string };
+
 function ViewInner(props: ViewProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState<NodeUnion>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [menu, setMenu] = useState<MenuState | null>(null);
   const rf = useReactFlow();
 
   useEffect(() => {
@@ -122,17 +126,37 @@ function ViewInner(props: ViewProps) {
   const onPaneContextMenu = useCallback(
     (event: React.MouseEvent | MouseEvent) => {
       event.preventDefault();
-      setMenu({ x: event.clientX, y: event.clientY });
+      setMenu({ kind: "pane", x: event.clientX, y: event.clientY });
+    },
+    [],
+  );
+
+  const onEdgeContextMenu = useCallback(
+    (event: React.MouseEvent, edge: Edge) => {
+      event.preventDefault();
+      setMenu({
+        kind: "edge",
+        x: event.clientX,
+        y: event.clientY,
+        edgeId: edge.id,
+      });
     },
     [],
   );
 
   const addViewerAtMenu = useCallback(() => {
-    if (!menu) return;
+    if (!menu || menu.kind !== "pane") return;
     const flowPos = rf.screenToFlowPosition({ x: menu.x, y: menu.y });
     setNodes((ns) => [...ns, makeViewerNode(flowPos)]);
     setMenu(null);
   }, [menu, rf, setNodes]);
+
+  const deleteMenuEdge = useCallback(() => {
+    if (!menu || menu.kind !== "edge") return;
+    const id = menu.edgeId;
+    setEdges((eds) => eds.filter((e) => e.id !== id));
+    setMenu(null);
+  }, [menu, setEdges]);
 
   return (
     <>
@@ -146,6 +170,7 @@ function ViewInner(props: ViewProps) {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onPaneContextMenu={onPaneContextMenu}
+        onEdgeContextMenu={onEdgeContextMenu}
         onPaneClick={() => setMenu(null)}
         colorMode={props.color}
         connectionMode={ConnectionMode.Loose}
@@ -158,9 +183,15 @@ function ViewInner(props: ViewProps) {
       </ReactFlow>
       {menu ? (
         <ContextMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)}>
-          <button type="button" onClick={addViewerAtMenu}>
-            add viewer node
-          </button>
+          {menu.kind === "pane" ? (
+            <button type="button" onClick={addViewerAtMenu}>
+              add viewer node
+            </button>
+          ) : (
+            <button type="button" onClick={deleteMenuEdge}>
+              delete edge
+            </button>
+          )}
         </ContextMenu>
       ) : null}
     </>
