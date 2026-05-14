@@ -4,7 +4,7 @@ export interface TubeSpecification {
   noob_id: string;
   noob_model: string;
   noob_version: string;
-  description: string;
+  description?: string;
   nodes: Record<string, NoobNode>;
   input?: Record<string, InputSpecification>;
 }
@@ -79,7 +79,38 @@ export type TitleNodeData = {
   description: string;
 } & Omit<ElkNodeData, "nodeType">;
 
+export type ViewerMode = "raw" | "line" | "image";
+
+export type ViewerNodeData = {
+  label: string;
+  mode: ViewerMode;
+  sourceHandles: Handle[];
+  targetHandles: Handle[];
+};
+
 export type ElkNode = Node<ElkNodeData, "elk">;
 export type GroupNode = Node<ElkNodeData, "group">;
 export type TitleNode = Node<TitleNodeData, "title">;
-export type NodeUnion = ElkNode | GroupNode | TitleNode;
+export type ViewerNode = Node<ViewerNodeData, "viewer">;
+export type NodeUnion = ElkNode | GroupNode | TitleNode | ViewerNode;
+
+export function isViewerNode(n: NodeUnion): n is ViewerNode {
+  return n.type === "viewer";
+}
+
+/**
+ * Parse a signal handle id like `counter.signals.count` into its parts.
+ * Returns null for handle ids that don't follow that shape (e.g. target
+ * slot handles, the viewer's own "in" handle).
+ */
+export function parseSignalHandle(
+  handleId: string,
+): { node_id: string; signal: string } | null {
+  const marker = ".signals.";
+  const idx = handleId.indexOf(marker);
+  if (idx < 0) return null;
+  return {
+    node_id: handleId.slice(0, idx),
+    signal: handleId.slice(idx + marker.length),
+  };
+}

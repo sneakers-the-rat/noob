@@ -1,0 +1,32 @@
+noob_id: gui-runner-demo
+noob_model: noob.tube.TubeSpecification
+noob_version: 0.0.1
+description: |
+  Minimal tube used by GUI runner-manager tests: a counter drives two sine
+  waves at different frequencies (so you can wire one to X and one to Y for
+  Lissajous figures in a line-plot viewer) and one numpy-free image source.
+
+nodes:
+  counter:
+    type: noob.testing.gui_demo.counter
+    params:
+      sleep_for: 0.0
+  sine_x:
+    type: noob.testing.gui_demo.sine
+    params:
+      period: 8.0
+    depends:
+      - count: counter.count
+  sine_y:
+    type: noob.testing.gui_demo.sine
+    params:
+      period: 6.0
+    depends:
+      - count: counter.count
+  gradient:
+    type: noob.testing.gui_demo.gradient_image
+    params:
+      width: 8
+      height: 4
+    depends:
+      - count: counter.count

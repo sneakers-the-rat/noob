@@ -1,0 +1,498 @@
+.runner-toolbar {
+  position: absolute;
+  top: 0.75em;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  gap: 0.75em;
+  align-items: center;
+  padding: 0.4em 0.8em;
+  border-radius: 0.6em;
+  background: color-mix(in srgb, var(--color-background) 80%, transparent);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--color-node-border);
+  font-family: var(--font-body);
+  color: var(--color-text);
+}
+
+.runner-toolbar-buttons {
+  display: flex;
+  gap: 0.4em;
+}
+
+.runner-toolbar button {
+  background: transparent;
+  color: var(--color-text);
+  border: 1px solid var(--color-node-border);
+  border-radius: 0.35em;
+  padding: 0.3em 0.7em;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+.runner-toolbar button:hover:not(:disabled) {
+  border-color: var(--color-primary);
+}
+.runner-toolbar button:disabled {
+  color: var(--color-disabled);
+  cursor: not-allowed;
+}
+
+.runner-state {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  font-size: 0.85em;
+  font-family: var(--font-monospace);
+}
+.runner-state-pill {
+  width: 0.7em;
+  height: 0.7em;
+  border-radius: 50%;
+  background: var(--color-disabled);
+  box-shadow: 0 0 0 0 transparent;
+  transition: box-shadow 0.2s ease;
+}
+.runner-state-uninitialized .runner-state-pill {
+  background: #555;
+}
+.runner-state-initialized .runner-state-pill {
+  background: #4aa3ff;
+}
+.runner-state-running .runner-state-pill {
+  background: #4ad295;
+  box-shadow: 0 0 8px 1px color-mix(in srgb, #4ad295 70%, transparent);
+  animation: runner-pulse 1.4s infinite ease-in-out;
+}
+.runner-state-stopped .runner-state-pill {
+  background: #c8a64b;
+}
+.runner-state-error .runner-state-pill {
+  background: #e8606d;
+}
+.runner-error {
+  color: #e8606d;
+  font-weight: 700;
+  cursor: help;
+}
+.runner-telemetry {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--font-monospace);
+  font-size: 0.8em;
+  color: var(--color-text-minor);
+  padding-left: 0.5em;
+  border-left: 1px solid var(--color-node-border);
+  font-variant-numeric: tabular-nums;
+}
+.runner-telemetry-count {
+  display: inline-block;
+  width: 5ch;
+  text-align: right;
+}
+.runner-telemetry-sep {
+  opacity: 0.5;
+}
+.runner-telemetry-last {
+  display: inline-block;
+  width: 16ch;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes runner-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.react-flow__node.node-active {
+  border-color: var(--color-primary);
+  box-shadow:
+    0 0 0 1px var(--color-primary),
+    0 0 18px 0 color-mix(in srgb, var(--color-primary) 50%, transparent);
+  transition: box-shadow 80ms ease-out, border-color 80ms ease-out;
+}
+
+/* Context menu (right-click on canvas) */
+.context-menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 12em;
+  background: color-mix(in srgb, var(--color-background) 92%, transparent);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--color-node-border);
+  border-radius: 0.4em;
+  padding: 0.3em;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-body);
+  color: var(--color-text);
+}
+.context-menu button {
+  background: transparent;
+  color: inherit;
+  border: none;
+  text-align: left;
+  padding: 0.35em 0.6em;
+  font: inherit;
+  font-size: 0.9em;
+  cursor: pointer;
+  border-radius: 0.25em;
+}
+.context-menu button:hover {
+  background: color-mix(in srgb, var(--color-primary) 25%, transparent);
+}
+
+/* Viewer node — cassette-futurism / 90s toy styling.
+ *
+ * Bright teal chassis with candy details (magenta close button, orange power
+ * LED). The screen stays dark so live data reads cleanly; the chunky bezel
+ * + chunky type around it carries the era.
+ */
+.react-flow__node-viewer {
+  /* override the generic node chrome from node.css */
+  padding: 8px 10px 6px 10px;
+  width: 14em;
+  height: 11em;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  background:
+    linear-gradient(180deg, #2dd4bf 0%, #0d9488 100%);
+  border: 2px solid #0f5f56;
+  border-radius: 18px;
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.45),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.22),
+    inset 5px 0 8px rgba(255, 255, 255, 0.05),
+    inset -5px 0 8px rgba(0, 0, 0, 0.15),
+    0 4px 12px rgba(0, 0, 0, 0.35);
+  font-family: var(--font-body);
+  color: var(--color-text);
+  overflow: hidden;
+}
+
+/*
+ * Screen is a clean dark navy surface inside a bezel — no overlays
+ * distorting the live data. The dark-blue tint reads as 90s computer
+ * monitor against the teal chassis.
+ */
+.viewer-screen {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #0c1424;
+  border-radius: 6px;
+  box-shadow:
+    inset 0 0 0 1px #04070d,
+    inset 0 2px 6px rgba(0, 0, 0, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.15);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.viewer-no-signal {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-monospace);
+  font-weight: 700;
+  letter-spacing: 0.25em;
+  font-size: 0.85em;
+  color: #67e8f9;
+  text-shadow:
+    0 0 4px rgba(103, 232, 249, 0.65),
+    0 0 12px rgba(103, 232, 249, 0.3);
+  animation: viewer-no-signal-blink 1.6s infinite ease-in-out;
+}
+@keyframes viewer-no-signal-blink {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.35; }
+}
+
+/* Candy magenta round close button */
+.viewer-close {
+  position: absolute;
+  top: 7px;
+  right: 9px;
+  z-index: 5;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  line-height: 1;
+  font-size: 0.75em;
+  font-weight: 700;
+  border-radius: 50%;
+  border: 1px solid #831843;
+  background:
+    radial-gradient(circle at 30% 25%, #fda4af 0%, #ec4899 50%, #be185d 100%);
+  color: #fff5fb;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25),
+    0 2px 3px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.3);
+}
+.viewer-close:hover {
+  background:
+    radial-gradient(circle at 30% 25%, #fecdd3 0%, #f472b6 50%, #db2777 100%);
+}
+
+/* Orange "POWER" LED with a soft glow */
+.viewer-led {
+  position: absolute;
+  bottom: 7px;
+  left: 12px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 30% 30%, #fff7ed 0%, #fb923c 55%, #c2410c 100%);
+  box-shadow:
+    0 0 6px rgba(251, 146, 60, 0.85),
+    0 0 1px rgba(0, 0, 0, 0.8),
+    inset 0 0 1px rgba(0, 0, 0, 0.4);
+  z-index: 5;
+}
+
+/* Maker's mark — chunky white VIEWER with magenta drop-shadow + yellow star */
+.viewer-brand {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.3em;
+  height: 1.4em;
+  margin-top: 3px;
+  user-select: none;
+}
+.viewer-logo-text {
+  font-family: var(--font-heading), "Lexend Deca", sans-serif;
+  font-weight: 800;
+  font-size: 0.85em;
+  color: #ffffff;
+  letter-spacing: 0.18em;
+  text-shadow:
+    1.5px 1.5px 0 #ec4899,
+    2.5px 2.5px 0 rgba(0, 0, 0, 0.2);
+}
+.viewer-logo-star {
+  color: #fde047;
+  font-size: 0.9em;
+  text-shadow:
+    1px 1px 0 #ea580c,
+    0 0 4px rgba(253, 224, 71, 0.5);
+  transform: translateY(-1px) rotate(15deg);
+  display: inline-block;
+}
+/*
+ * Resize handles -- xyflow renders a 1px line per edge by default which is
+ * miserable to grab. We blow up the hit area to ~10px while keeping a 2px
+ * visible accent that only shows on hover, plus dash the node border when
+ * hovering any resize zone so it's obvious where you can grab.
+ *
+ * Specificity dance: xyflow sets line dimensions via inline style, so we
+ * override with the `.react-flow__resize-control.line` selectors and
+ * !important.
+ */
+.react-flow__resize-control.line.viewer-resize-line {
+  background: transparent !important;
+  border: none !important;
+}
+.react-flow__resize-control.line.top.viewer-resize-line {
+  top: -5px !important;
+  height: 10px !important;
+}
+.react-flow__resize-control.line.bottom.viewer-resize-line {
+  bottom: -5px !important;
+  height: 10px !important;
+}
+.react-flow__resize-control.line.left.viewer-resize-line {
+  left: -5px !important;
+  width: 10px !important;
+}
+.react-flow__resize-control.line.right.viewer-resize-line {
+  right: -5px !important;
+  width: 10px !important;
+}
+
+/* Thin accent line, drawn down the centre of the (wide) hit area. */
+.react-flow__resize-control.line.viewer-resize-line::after {
+  content: "";
+  position: absolute;
+  background: var(--color-primary);
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+.react-flow__resize-control.line.top.viewer-resize-line::after,
+.react-flow__resize-control.line.bottom.viewer-resize-line::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+}
+.react-flow__resize-control.line.left.viewer-resize-line::after,
+.react-flow__resize-control.line.right.viewer-resize-line::after {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+}
+.react-flow__resize-control.line.viewer-resize-line:hover::after {
+  opacity: 1;
+}
+
+.viewer-resize-handle {
+  background: var(--color-primary) !important;
+  border: 2px solid var(--color-background) !important;
+  border-radius: 50% !important;
+  width: 14px !important;
+  height: 14px !important;
+}
+
+/* Dash the viewer node's border while hovering ANY resize control on it,
+   so you get a clear "ready to resize" affordance before clicking. */
+.react-flow__node-viewer:has(
+  .react-flow__resize-control:hover
+) {
+  border-style: dashed;
+  border-color: var(--color-primary);
+}
+.viewer-header {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4em;
+  padding: 0.3em 0.5em;
+  border-bottom: 1px solid rgba(103, 232, 249, 0.18);
+  font-family: var(--font-monospace);
+  font-size: 0.78em;
+  color: #67e8f9;
+  text-shadow: 0 0 2px rgba(103, 232, 249, 0.45);
+}
+.viewer-source {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  /* inherits the phosphor color + glow from .viewer-header */
+}
+.viewer-display {
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  min-height: 0;
+  padding: 0.3em 0.5em;
+  display: flex;
+  flex-direction: column;
+}
+.viewer-display > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Row of phosphor-LED-style mode buttons (RAW / LINE / IMG). */
+.viewer-modes {
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  padding: 1px;
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(184, 230, 168, 0.25);
+  border-radius: 3px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+.viewer-mode-btn {
+  appearance: none;
+  background: transparent;
+  color: #b8e6a8;
+  border: none;
+  padding: 1px 6px;
+  font-family: var(--font-monospace);
+  font-size: 0.95em;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  border-radius: 2px;
+  line-height: 1.2;
+  transition:
+    background 80ms ease-out,
+    color 80ms ease-out,
+    text-shadow 80ms ease-out;
+}
+.viewer-mode-btn:hover {
+  background: rgba(184, 230, 168, 0.12);
+  text-shadow: 0 0 3px rgba(184, 230, 168, 0.6);
+}
+.viewer-mode-btn.active {
+  color: #e3ffd2;
+  background: rgba(184, 230, 168, 0.22);
+  text-shadow:
+    0 0 4px rgba(184, 230, 168, 0.85),
+    0 0 10px rgba(184, 230, 168, 0.35);
+  box-shadow: inset 0 0 6px rgba(184, 230, 168, 0.25);
+}
+.viewer-mode-btn.na {
+  color: rgba(184, 230, 168, 0.35);
+  text-shadow: none;
+}
+.viewer-mode-btn.na.active {
+  /* Picked-but-incompatible: keep selection visible without the bright glow. */
+  color: rgba(184, 230, 168, 0.7);
+  background: rgba(184, 230, 168, 0.1);
+  text-shadow: none;
+  box-shadow: inset 0 0 4px rgba(184, 230, 168, 0.15);
+}
+
+/* Reskin the bundled displays when they're rendered inside a viewer screen. */
+.viewer-display .runner-display-raw {
+  background: transparent;
+  color: #b8e6a8;
+  text-shadow: 0 0 1px rgba(184, 230, 168, 0.4);
+  padding: 0.2em 0;
+}
+.viewer-display .runner-display-info {
+  color: rgba(184, 230, 168, 0.55);
+}
+
+.runner-display-raw {
+  font-family: var(--font-monospace);
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: color-mix(in srgb, var(--color-background) 70%, black);
+  padding: 0.6em;
+  border-radius: 0.4em;
+  max-height: 18em;
+  overflow: auto;
+}
+
+.runner-display-image canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  image-rendering: pixelated;
+  background: #000;
+  border-radius: 0.3em;
+}
+
+.runner-display-info {
+  margin-top: 0.4em;
+  font-family: var(--font-monospace);
+  font-size: 0.8em;
+  color: var(--color-text-minor);
+}
+

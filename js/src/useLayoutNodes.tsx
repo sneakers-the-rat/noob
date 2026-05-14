@@ -40,18 +40,30 @@ const elk = new ELK();
  * uses elkjs to give each node a layouted position
  * Have to re-nest the graph here - elk uses nested graph, reactflow uses flat node structure
  * https://github.com/xyflow/xyflow/discussions/3495
+ *
+ * Viewer nodes (and the edges that connect to them) are GUI-only overlays
+ * placed by the user; we leave their positions alone instead of letting ELK
+ * scoop them up next to the tube graph.
  */
 export const getLayoutedNodes = async (
   nodes: NodeUnion[],
   edges: Edge[],
 ): Promise<NodeUnion[]> => {
+  const viewerIds = new Set(
+    nodes.filter((n) => n.type === "viewer").map((n) => n.id),
+  );
+  const structural = nodes.filter((n) => n.type !== "viewer");
+  const structuralEdges = edges.filter(
+    (e) => !viewerIds.has(e.source) && !viewerIds.has(e.target),
+  );
+
   const graph = {
     id: "root",
     layoutOptions,
-    children: nodes
+    children: structural
       .filter((n) => n.parentId === undefined)
-      .map((n) => nodeToElk(n, nodes)),
-    edges: edges.map((e) => ({
+      .map((n) => nodeToElk(n, structural)),
+    edges: structuralEdges.map((e) => ({
       id: e.id,
       sources: [e.sourceHandle || e.source],
       targets: [e.targetHandle || e.target],
@@ -63,10 +75,13 @@ export const getLayoutedNodes = async (
   });
   const flatChildren = flattenChildren(layoutedGraph);
 
-  const titleNode = nodes.filter((n) => n.type === "title")[0];
+  const titleNode = structural.filter((n) => n.type === "title")[0];
   const titleHeight = titleNode?.measured?.height ?? 0;
 
   return nodes.map<NodeUnion>((node) => {
+    // user-placed viewer nodes keep their hand-set position
+    if (node.type === "viewer") return node;
+
     const layoutedNode = flatChildren.find((lgNode) => lgNode.id === node.id);
 
     // reorder ports by y position
@@ -95,7 +110,6 @@ export const getLayoutedNodes = async (
 
     return {
       ...node,
-      data: { ...node.data },
       position: { x, y },
       // the reactflow-generated widths/heights are better for display,
       // but the elk widths/heights are better for nested nodes for some reason.

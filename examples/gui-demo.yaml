@@ -1,0 +1,34 @@
+noob_id: gui-demo
+noob_model: noob.tube.TubeSpecification
+noob_version: 0.0.1
+description: |
+  Demo tube for the live-running GUI: a counter drives two sine scalars at
+  different frequencies and an animated grayscale gradient. Open in the GUI,
+  right-click to add a viewer node, then drag one signal onto each input.
+  Wire ``sine_x`` to ``x`` and ``sine_y`` to ``y`` of a line-plot viewer to
+  draw Lissajous figures.
+
+nodes:
+  counter:
+    type: noob.testing.gui_demo.counter
+    params:
+      sleep_for: 0.05
+  sine_x:
+    type: noob.testing.gui_demo.sine
+    params:
+      period: 40.0
+    depends:
+      - count: counter.count
+  sine_y:
+    type: noob.testing.gui_demo.sine
+    params:
+      period: 30.0
+    depends:
+      - count: counter.count
+  gradient:
+    type: noob.testing.gui_demo.gradient_image
+    params:
+      width: 96
+      height: 64
+    depends:
+      - count: counter.count
