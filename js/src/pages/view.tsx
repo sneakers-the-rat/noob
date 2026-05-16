@@ -80,6 +80,7 @@ function ViewInner(props: ViewProps) {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const rf = useReactFlow();
+  useLayoutNodes();
 
   useEffect(() => {
     const socket = new WebSocket(`/spec/${props.tube_id}`);
@@ -87,7 +88,7 @@ function ViewInner(props: ViewProps) {
       if (typeof event.data !== "string") return;
       const next = JSON.parse(event.data) as TubeSpecification;
       const [structuralEdges, structuralNodes] = tubeToFlow(next);
-      let viewerIds: Set<string> = new Set();
+      let viewerIds = new Set<string>();
       setNodes((prev) => {
         const viewers = prev.filter(isViewerNode);
         viewerIds = new Set(viewers.map((v) => v.id));
@@ -101,7 +102,7 @@ function ViewInner(props: ViewProps) {
     return () => socket.close();
   }, [props.tube_id, setNodes, setEdges]);
 
-  useLayoutNodes();
+
 
   const onConnect = useCallback(
     (conn: Connection) => {
@@ -176,7 +177,6 @@ function ViewInner(props: ViewProps) {
         connectionMode={ConnectionMode.Loose}
         minZoom={0.1}
         maxZoom={10}
-        fitView
       >
         <Background />
         <Controls />

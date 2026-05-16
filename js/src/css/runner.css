@@ -147,6 +147,33 @@
   background: color-mix(in srgb, var(--color-primary) 25%, transparent);
 }
 
+/*
+ * Viewer handles use STANDARD xyflow positioning (position: absolute, with
+ * xyflow's own inline-styled top/left/transform). Just the label sits to
+ * the right of the handle as an absolutely-positioned span — no flex
+ * wrapper here. Wrapping handles in a transformed flex container is what
+ * caused the cumulative click-vs-edge drift on additional viewers.
+ */
+.react-flow__node-viewer .react-flow__handle {
+  background: var(--xy-handle-background-color-default);
+  border: 1px solid var(--xy-handle-border-color-default);
+}
+.viewer-handle-label {
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-left: 0.4em;
+  font-family: var(--font-monospace);
+  font-size: 0.75em;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(15, 95, 86, 0.7);
+  padding: 0 0.3em;
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 /* Viewer node — cassette-futurism / 90s toy styling.
  *
  * Bright teal chassis with candy details (magenta close button, orange power
@@ -154,11 +181,16 @@
  * + chunky type around it carries the era.
  */
 .react-flow__node-viewer {
-  /* override the generic node chrome from node.css */
+  /* override the generic node chrome from node.css.
+   * IMPORTANT: do NOT set `position: relative` here. xyflow positions every
+   * node with `position: absolute; transform: translate(x, y)`. If we
+   * override to relative the node becomes an in-flow element, every new
+   * viewer is stacked below the previous one, and the transform is then
+   * applied relative to that stacked position — producing the cumulative
+   * "viewer drops further and further below the cursor" bug. */
   padding: 8px 10px 6px 10px;
   width: 14em;
   height: 11em;
-  position: relative;
   display: flex;
   flex-direction: column;
   align-items: stretch;

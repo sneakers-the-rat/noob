@@ -1,8 +1,13 @@
 // Initialized from https://reactflow.dev/examples/layout/elkjs-multiple-handles
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import ELK from "elkjs/lib/elk.bundled.js";
-import { type Edge, useNodesInitialized, useReactFlow } from "@xyflow/react";
+import {
+  type Edge,
+  useNodes,
+  useNodesInitialized,
+  useReactFlow,
+} from "@xyflow/react";
 
 import type { NodeUnion } from "./types";
 
@@ -121,23 +126,51 @@ export const getLayoutedNodes = async (
   });
 };
 
+/**
+ * Run ELK layout + fitView whenever the **structural** (non-viewer) node set
+ * changes. Viewer nodes are user-placed overlays and must NOT re-trigger
+ * layout — that's what caused the cumulative click-position drift bug, where
+ * each new viewer added a fitView pass that shifted the viewport and the
+ * next click→flow translation landed slightly lower than the previous one.
+ */
 export default function useLayoutNodes() {
   const nodesInitialized = useNodesInitialized();
-  const { getNodes, getEdges, setNodes, fitView } = useReactFlow<NodeUnion>();
+  const { getNodes, getEdges, setNodes, fitView } =
+    useReactFlow<NodeUnion>();
+  // Subscribe to the live node list so the structural signature recomputes
+  // when structural nodes are added/removed.
+  const liveNodes = useNodes();
+  const structuralSig = liveNodes
+    .filter((n) => n.type !== "viewer")
+    .map((n) => n.id)
+    .sort()
+    .join(",");
+  const lastSigRef = useRef<string>("");
 
   useEffect(() => {
-    if (nodesInitialized) {
-      const layoutNodes = async () => {
-        const layoutedNodes = await getLayoutedNodes(getNodes(), getEdges());
-        setNodes(layoutedNodes);
-        await fitView();
-      };
-
-      void layoutNodes();
-    }
-  }, [nodesInitialized, getNodes, getEdges, setNodes, fitView]);
-
-  return null;
+    if (!nodesInitialized) return;
+    // Skip when only viewer membership changed (structural unchanged).
+    if (structuralSig === lastSigRef.current) return;
+    let cancelled = false;
+    const sigAtStart = structuralSig;
+    (async () => {
+      const layoutedNodes = await getLayoutedNodes(getNodes(), getEdges());
+      if (cancelled) return;
+      setNodes(layoutedNodes);
+      lastSigRef.current = sigAtStart;
+      await fitView();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    nodesInitialized,
+    structuralSig,
+    getNodes,
+    getEdges,
+    setNodes,
+    fitView,
+  ]);
 }
 
 function nodeToElk(n: NodeUnion, nodes: NodeUnion[]): PropertiedElkNode {

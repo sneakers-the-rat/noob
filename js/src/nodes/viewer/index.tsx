@@ -15,6 +15,7 @@
 
 import { useEffect, useMemo } from "react";
 import {
+  Handle,
   NodeResizer,
   type Edge,
   type NodeProps,
@@ -29,7 +30,6 @@ import {
   type ViewerMode,
   parseSignalHandle,
 } from "../../types.ts";
-import { LabeledHandle } from "../../handle.tsx";
 import { useOptionalSignal } from "../../run/RunContext.tsx";
 import type { ValueRecord } from "../../run/protocol.ts";
 import { ALL_MODES, DISPLAYS } from "./displays/index.ts";
@@ -64,16 +64,21 @@ export default function ViewerNode({
     updateNodeInternals(id);
   }, [id, data.mode, updateNodeInternals]);
 
-  const display = DISPLAYS[data.mode];
+  const display = DISPLAYS[data.mode ?? "raw"];
 
-  // Fixed-position hook calls — declared per known handle id so we can call
-  // `useOptionalSignal` unconditionally. Currently the only handles in use
-  // are "in" (always) and "x" (line mode); adding more is a one-line addition
-  // here and in the relevant display module.
+  // Handles are rendered with id `${nodeId}.${local}` (so they're globally
+  // unique across viewer instances — xyflow's internal handle map otherwise
+  // collides when two viewers both have a handle named "in"). Keep the
+  // map keyed by the *local* part ("in", "x") for ergonomic lookup below.
   const incomingByHandle = useMemo(() => {
     const m: Record<string, Edge> = {};
+    const prefix = `${id}.`;
     for (const e of edges) {
-      if (e.target === id && e.targetHandle) m[e.targetHandle] = e;
+      if (e.target !== id || !e.targetHandle) continue;
+      const local = e.targetHandle.startsWith(prefix)
+        ? e.targetHandle.slice(prefix.length)
+        : e.targetHandle;
+      m[local] = e;
     }
     return m;
   }, [edges, id]);
@@ -114,7 +119,11 @@ export default function ViewerNode({
   };
 
   const changeMode = (next: ViewerMode) => {
-    const validHandles = new Set(DISPLAYS[next].handles.map((h) => h.id));
+    // Match against full prefixed handle ids — that's what edge.targetHandle
+    // holds for our viewer-node target handles.
+    const validHandles = new Set(
+      DISPLAYS[next].handles.map((h) => `${id}.${h.id}`),
+    );
     setEdges((eds) =>
       eds.filter(
         (e) => e.target !== id || validHandles.has(e.targetHandle ?? ""),
@@ -138,17 +147,32 @@ export default function ViewerNode({
         lineClassName="viewer-resize-line"
         handleClassName="viewer-resize-handle"
       />
-      <div className="handles targets">
-        {display.handles.map((h) => (
-          <LabeledHandle
-            key={h.id}
-            id={h.id}
+      {/*
+       * Standard xyflow handle positioning: each Handle is `position: absolute`
+       * inside the node wrapper with xyflow's own inline styles. We just
+       * override `top` to distribute multiple handles vertically. Wrapping
+       * handles in a custom flex container (the previous approach) broke
+       * xyflow's handle-position cache and produced cumulative offsets
+       * between successive viewer instances.
+       */}
+      {display.handles.map((h, i) => {
+        const n = display.handles.length;
+        // Evenly space N handles down the left edge: i+1 / N+1 of height.
+        const top = `${((i + 1) * 100) / (n + 1)}%`;
+        return (
+          <Handle
+            key={`${id}.${h.id}`}
+            id={`${id}.${h.id}`}
             type="target"
             position={Position.Left}
-            label={h.label}
-          />
-        ))}
-      </div>
+            style={{ top }}
+          >
+            {h.label ? (
+              <span className="viewer-handle-label">{h.label}</span>
+            ) : null}
+          </Handle>
+        );
+      })}
       <button
         type="button"
         className="viewer-close"
@@ -162,7 +186,7 @@ export default function ViewerNode({
       <span className="viewer-led" />
       <div className="viewer-screen">
         <Header
-          mode={data.mode}
+          mode={data.mode ?? "raw"}
           compatible={compatible}
           onChange={changeMode}
           sources={sources}
