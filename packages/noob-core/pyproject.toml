@@ -1,0 +1,41 @@
+[project]
+name = "noob-core"
+description = "Optimized rust core for the noob scheduler"
+authors = [
+    {name = "raymondwjang", email = "ray0815@ucla.edu"},
+    {name= "sneakers-the-rat", email = "sneakers-the-rat@protonmail.com"}
+]
+version = "0.1.0"
+dependencies = []
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = [
+    "pipeline",
+    "pipelines",
+    "data-processing",
+    "graph-processing",
+    "topological-sort",
+    "rust",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Typing :: Typed"
+]
+
+[project.urls]
+homepage = "https://noob.readthedocs.io"
+documentation = "https://noob.readthedocs.io"
+repository = "https://github.com/miniscope/noob"
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "noob_core"
+features = ["pyo3/extension-module"]

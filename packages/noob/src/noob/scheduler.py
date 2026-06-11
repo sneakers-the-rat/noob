@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 from collections import defaultdict, deque
 from collections.abc import MutableSequence
 from copy import deepcopy
@@ -606,3 +607,13 @@ class Scheduler:
 
             for exclusive in exclusive_subgraph:
                 self._epochs[subepoch].mark_expired(exclusive)
+
+
+PythonScheduler = Scheduler
+"""The pure-python scheduler, always available regardless of the active implementation."""
+
+if os.environ.get("NOOB_SCHEDULER", "").lower() not in ("python", "py"):
+    # use the optimized rust scheduler when the optional noob-core package
+    # is installed. set NOOB_SCHEDULER=python to force the pure-python one.
+    with contextlib.suppress(ImportError):
+        from noob.rust_scheduler import RustScheduler as Scheduler  # noqa: F811
