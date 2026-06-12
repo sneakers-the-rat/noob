@@ -16,26 +16,33 @@ set the environment variable `NOOB_SCHEDULER=python` before importing `noob`.
 
 ## Design
 
-All scheduler state - the per-epoch topological sorters, epoch bookkeeping,
-subepoch relationships, and frozen graph templates - lives in rust
-(`CoreScheduler` in this crate). Only native types (strings, ints, bools,
-tuples, lists) cross the python:rust barrier:
+The scheduler is a container of topo sorters:
 
-- a graph item is a node id `str` or a `(node_id, signal)` tuple
-- an epoch is a tuple of `(node_id, int)` segments
-- events are decomposed to `(epoch, node_id, signal, is_noevent, is_meta)` tuples
+- `CoreTopoSorter` is a standalone topological sorter over interned graph
+  items. It knows nothing about the scheduler.
+- `CoreScheduler` owns one sorter per epoch (plus the frozen graph templates
+  epochs are cloned from) and hands out shared `CoreTopoSorter` handles, so
+  driving a handle with `get_ready()`/`done()` advances the real epoch.
 
-The python-side wrapper (`noob.rust_scheduler.RustScheduler`) converts
-`Edge` / `NodeSpecification` / `Epoch` / `Event` objects at the boundary and
-reconstructs `Epoch`s, `MetaEvent`s, and `TopoSorter`-compatible views on the
-way back, so it is a drop-in replacement for `noob.scheduler.Scheduler`.
+All scheduler state and logic live in rust. Conversion happens once, at the
+boundary: the core accepts and returns real `noob` objects ( `Epoch` ,
+`NodeSignal` , `MetaEvent` dicts) and raises `noob.exceptions` types directly,
+constructing them through cached class references rather than calling back
+into python logic. The python wrappers
+(`noob.rust_scheduler.RustScheduler` / `RustTopoSorter`) are pure delegation,
+existing only to carry the `nodes` / `edges` python attributes and to subclass
+`TopoSorter` for `isinstance` compatibility.
+
+When used standalone (without `noob` installed), `CoreTopoSorter` still works,
+returning plain tuples for `(node, signal)` items and raising its own
+exception types; the scheduler's event-facing APIs require `noob`.
 
 ## Building
 
+Installed editable as part of the noob dev environment:
+
 ```bash
-# from packages/noob-core
-pip install maturin
-maturin develop --release
-# or build a wheel
-maturin build --release
+pip install -e packages/noob-core
 ```
+
+Re-run after changing rust sources to recompile (builds are incremental).

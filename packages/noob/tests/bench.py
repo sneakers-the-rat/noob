@@ -2,7 +2,9 @@ import pytest
 from pytest_codspeed.plugin import BenchmarkFixture
 
 from noob import Tube
+from noob.edge import Edge
 from noob.runner.base import TubeRunner
+from noob.scheduler import Scheduler
 
 
 def test_load_tube(benchmark: BenchmarkFixture) -> None:
@@ -43,3 +45,61 @@ def _run_sorter(tube: Tube) -> None:
         ready_nodes = sorter.get_ready()
         for node in ready_nodes:
             sorter.done(node)
+
+
+@pytest.fixture
+def wide_scheduler() -> Scheduler:
+    """
+    A scheduler over a wide, layered synthetic graph (200 nodes, ~400 edges),
+    larger than the testing tubes, to benchmark scheduling at a size where
+    graph work dominates over per-call overhead.
+    """
+    width, depth = 20, 10
+    edges = []
+    for layer in range(1, depth):
+        for i in range(width):
+            edges.append(
+                Edge(
+                    source_node=f"n{layer - 1}_{i}",
+                    source_signal="value",
+                    target_node=f"n{layer}_{i}",
+                    target_slot="value",
+                )
+            )
+            edges.append(
+                Edge(
+                    source_node=f"n{layer - 1}_{(i + 1) % width}",
+                    source_signal="other",
+                    target_node=f"n{layer}_{i}",
+                    target_slot="other",
+                )
+            )
+    return Scheduler(nodes={}, edges=edges)
+
+
+def test_scheduler_add_epoch(benchmark: BenchmarkFixture, wide_scheduler: Scheduler) -> None:
+    """
+    Creating and ending epochs (i.e. copying the frozen graph template)
+    should be fast on graphs with hundreds of nodes
+    """
+
+    def _add_end() -> None:
+        epoch = wide_scheduler.add_epoch()
+        wide_scheduler.end_epoch(epoch)
+
+    benchmark(_add_end)
+
+
+def test_scheduler_epoch_drive(benchmark: BenchmarkFixture, wide_scheduler: Scheduler) -> None:
+    """
+    Driving a full epoch through its sorter should be fast
+    on graphs with hundreds of nodes
+    """
+
+    def _drive() -> None:
+        epoch = wide_scheduler.add_epoch()
+        sorter = wide_scheduler._epochs[epoch]
+        while sorter.is_active():
+            sorter.done(*sorter.get_ready())
+
+    benchmark(_drive)

@@ -39,3 +39,6 @@ build-backend = "maturin"
 [tool.maturin]
 module-name = "noob_core"
 features = ["pyo3/extension-module"]
+# an accelerator package is pointless unoptimized -
+# build release even for editable installs
+profile = "release"

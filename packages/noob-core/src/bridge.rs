@@ -113,7 +113,13 @@ pub fn meta_event<'py>(
 /// An `EpochEnded` MetaEvent: value is the epoch, timestamp is UTC-aware
 pub fn epoch_ended_event<'py>(py: Python<'py>, epoch: &EpochKey) -> PyResult<Bound<'py, PyDict>> {
     let bridge = Bridge::get(py)?;
-    meta_event(py, &bridge.epoch_ended, epoch, epoch_to_py(py, epoch)?, true)
+    meta_event(
+        py,
+        &bridge.epoch_ended,
+        epoch,
+        epoch_to_py(py, epoch)?,
+        true,
+    )
 }
 
 /// A `NodeReady` MetaEvent: value is the node id, timestamp is naive

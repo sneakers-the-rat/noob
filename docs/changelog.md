@@ -9,12 +9,13 @@
 - `noob-core` - an optional rust implementation of the scheduler and topo sorter
   (`packages/noob-core`, pyO3 bindings).
   When installed, `noob.scheduler.Scheduler` *is* the rust-backed
-  `noob.rust_scheduler.RustScheduler`, a drop-in 1:1 replacement -
-  no code changes needed. The pure-python scheduler remains in place
-  and is used when `noob-core` is not installed,
+  `noob.rust_scheduler.RustScheduler`, a drop-in replacement for the public
+  scheduler API - no code changes needed. The pure-python scheduler remains in
+  place and is used when `noob-core` is not installed,
   or when `NOOB_SCHEDULER=python` is set.
-  The rust `CoreScheduler` owns one `CoreTopoSorter` per epoch and only
-  native types cross the python:rust barrier.
+  The rust `CoreScheduler` owns one `CoreTopoSorter` per epoch; all scheduler
+  logic runs in rust, and `Epoch`/`NodeSignal`/`MetaEvent` objects are
+  constructed at the barrier, so the python classes are pure delegation.
   ~3x faster epoch scheduling on medium-sized (hundreds of nodes) graphs.
 
 ### v1000.1.0 - 26-05-18

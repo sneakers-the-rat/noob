@@ -7,6 +7,7 @@
 
 use pyo3::prelude::*;
 
+pub mod bridge;
 pub mod epoch;
 pub mod errors;
 pub mod item;
