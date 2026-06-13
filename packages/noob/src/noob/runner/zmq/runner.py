@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import math
 import multiprocessing as mp
 import threading
@@ -11,7 +12,7 @@ from typing import Any, cast, overload
 from uuid import uuid4
 
 from noob.event import Event, MetaEvent, MetaEventType, MetaSignal
-from noob.exceptions import InputMissingError
+from noob.exceptions import EpochCompletedError, InputMissingError
 from noob.input import InputScope
 from noob.network.message import ErrorMsg, ErrorValue, EventMsg, Message, MessageType
 from noob.node import Return
@@ -335,8 +336,18 @@ class ZMQRunner(TubeRunner):
         if not self._ignore_events:
             for event in msg.value:
                 event = cast(Event, event)
+                # NoEvents are scheduling information, not collectible values:
+                # storing them would make downstream collectors (e.g. the return node)
+                # see them as emitted values rather than as an absence
+                if event["value"] is MetaSignal.NoEvent:
+                    continue
                 self.store.add(event)
-        events = self.tube.scheduler.update([e for e in msg.value if e["node_id"] != "assets"])
+        events = [e for e in msg.value if e["node_id"] != "assets"]
+        # events can arrive after their epoch has completed,
+        # e.g. NoEvents published by node runners canceled by an upstream NoEvent
+        # when the rest of the graph already finished the epoch
+        with contextlib.suppress(EpochCompletedError):
+            events = self.tube.scheduler.update(events)
         events = cast(MutableSequence[Event | MetaEvent], events)
         epochs = set(e["epoch"] for e in msg.value)
         if self._return_node is not None:

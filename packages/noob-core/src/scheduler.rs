@@ -5,12 +5,14 @@ use indexmap::{IndexMap, IndexSet};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyTuple};
 
-use crate::bridge::{epoch_ended_event, epoch_to_py, node_ready_event, Bridge};
+use crate::bridge::{
+    epoch_ended_event, epoch_to_py, node_canceled_event, node_ready_event, Bridge,
+};
 use crate::epoch::{fmt_epoch, get_ready_order, parent, parents, root_int, Ep, EpochArg, EpochKey};
 use crate::errors::{CoreError, CoreResult};
 use crate::item::{Interner, Item};
 use crate::pysorter::{CoreTopoSorter, SharedInterner, SharedSorter};
-use crate::sorter::{extract_nodes, EdgeRec, Sorter};
+use crate::sorter::{extract_nodes, EdgeRec, NodeFlags, Sorter};
 
 /// Virtual nodes that don't actually exist as nodes but can be depended on
 const VIRTUAL_NODES: [&str; 2] = ["input", "assets"];
@@ -61,12 +63,12 @@ fn downstream_nodes(edges: &[EdgeRec], node_id: &str, exclude: Option<&str>) -> 
 /// All conversion happens at the boundary via [`crate::bridge`]: methods
 /// accept and return real `noob` objects (`Epoch`, `NodeSignal`, `MetaEvent`
 /// dicts) and raise `noob.exceptions` types, so the python wrapper
-/// (`noob.rust_scheduler.RustScheduler`) is pure delegation.
+/// (`noob_core.RustScheduler`) is pure delegation.
 #[pyclass(module = "noob_core")]
 pub struct CoreScheduler {
     interner: SharedInterner,
-    /// node id -> enabled
-    nodes: IndexMap<String, bool>,
+    /// node id -> enabled/stateful flags
+    nodes: IndexMap<String, NodeFlags>,
     edges: Vec<EdgeRec>,
     source_nodes: Vec<String>,
     /// (node id, signal) pairs depended on in the graph
@@ -76,12 +78,27 @@ pub struct CoreScheduler {
     subepochs: HashMap<EpochKey, IndexSet<EpochKey>>,
     epoch_log: VecDeque<i64>,
     /// node id -> (subgraph nodes, subgraph edges), mirrors `_subgraphs`
-    subgraphs: HashMap<String, (IndexMap<String, bool>, Vec<EdgeRec>)>,
+    subgraphs: HashMap<String, (IndexMap<String, NodeFlags>, Vec<EdgeRec>)>,
     /// epoch node-id path -> template sorter, mirrors `_frozen_sorters`
     frozen: HashMap<Vec<String>, Sorter>,
     /// python logger, used on the debug/warning paths the python
     /// scheduler logs on
     logger: Option<Py<PyAny>>,
+
+    // ------ run control, mirrors `Scheduler._freerun` etc. ------
+    /// permission to run any epoch as soon as it is ready
+    freerun: bool,
+    /// root epochs we have permission to run, in the order granted
+    run_queue: Vec<i64>,
+    /// next epoch number to grant for implicit (`start n`/freerun) permission
+    grant_clock: i64,
+    /// stateful watermark: per node, the lowest root epoch it has not completed.
+    /// stateful nodes are only ready in an epoch when their watermark reaches it.
+    progress: HashMap<String, i64>,
+    /// (epoch, node) cancellations from expiry cascades, drained by `update`
+    pending_canceled: Vec<(EpochKey, String)>,
+    /// per `next_events(node_id)` iteration: epochs whose ending we owe the caller
+    iter_pending_end: HashMap<Option<String>, IndexSet<EpochKey>>,
 }
 
 impl Clone for CoreScheduler {
@@ -109,6 +126,12 @@ impl Clone for CoreScheduler {
             subgraphs: self.subgraphs.clone(),
             frozen: self.frozen.clone(),
             logger: Python::with_gil(|py| self.logger.as_ref().map(|l| l.clone_ref(py))),
+            freerun: self.freerun,
+            run_queue: self.run_queue.clone(),
+            grant_clock: self.grant_clock,
+            progress: self.progress.clone(),
+            pending_canceled: self.pending_canceled.clone(),
+            iter_pending_end: self.iter_pending_end.clone(),
         }
     }
 }
@@ -162,9 +185,9 @@ impl CoreScheduler {
             return;
         }
         let downstream = downstream_nodes(&self.edges, node_id, None);
-        let sub_nodes: IndexMap<String, bool> = downstream
+        let sub_nodes: IndexMap<String, NodeFlags> = downstream
             .iter()
-            .filter_map(|id| self.nodes.get(id).map(|enabled| (id.clone(), *enabled)))
+            .filter_map(|id| self.nodes.get(id).map(|flags| (id.clone(), *flags)))
             .collect();
         let sub_edges: Vec<EdgeRec> = self
             .edges
@@ -259,7 +282,7 @@ impl CoreScheduler {
                 } else if parent_sorter.done.contains(&parent_dep)
                     && !exclude_current.contains(&parent_dep)
                 {
-                    sorter.mark_expired(&[parent_dep], false);
+                    sorter.mark_expired(&[parent_dep], false, false);
                 } else if parent_sorter.out.contains(&parent_dep) {
                     sorter.mark_out(&[parent_dep]);
                 }
@@ -275,7 +298,9 @@ impl CoreScheduler {
                 .insert(epoch.clone());
         }
 
-        // a node inducing subepochs expires the node in the immediate parent
+        // a node inducing subepochs expires the node in the immediate parent.
+        // this is bookkeeping, not cancellation:
+        // the node's work continues in the subepochs
         let parent_done = parent_arc
             .lock()
             .expect("sorter lock")
@@ -283,7 +308,7 @@ impl CoreScheduler {
             .contains(&inducing_node);
         if !parent_done {
             let node_id = epoch[epoch.len() - 1].0.clone();
-            self.expire_impl(&parent_key, &node_id, None, false, false)?;
+            self.expire_impl(&parent_key, &node_id, None, false, false, false)?;
         }
         Ok(())
     }
@@ -376,7 +401,7 @@ impl CoreScheduler {
             sorter_arc
                 .lock()
                 .expect("sorter lock")
-                .mark_expired(&[to_mark], false);
+                .mark_expired(&[to_mark], false, false);
         }
 
         if signal.is_none() && with_signals {
@@ -409,7 +434,11 @@ impl CoreScheduler {
         Ok(None)
     }
 
-    /// Mark a node expired; if that completes the epoch, end it and return it
+    /// Mark a node expired; if that completes the epoch, end it and return it.
+    ///
+    /// With `cascade` (a "real" expiration, e.g. a `NoEvent`), transitively
+    /// expire everything that requires the expired item, recording
+    /// `NodeCanceled` events for the canceled nodes (drained by `update`).
     fn expire_impl(
         &mut self,
         epoch: &EpochKey,
@@ -417,6 +446,7 @@ impl CoreScheduler {
         signal: Option<&str>,
         with_signals: bool,
         unlock_optionals: bool,
+        cascade: bool,
     ) -> CoreResult<Option<EpochKey>> {
         let to_mark = {
             let mut interner = self.lock_interner();
@@ -427,10 +457,10 @@ impl CoreScheduler {
         };
 
         self.ensure_epoch(epoch)?;
-        {
+        let expired: Vec<u32> = {
             let sorter_arc = self.epoch_sorter(epoch)?;
             let mut sorter = sorter_arc.lock().expect("sorter lock");
-            sorter.mark_expired(&[to_mark], unlock_optionals);
+            let expired = sorter.mark_expired(&[to_mark], unlock_optionals, cascade);
             // if any immediate successors are already marked "ready",
             // we also want to cancel them
             if let Some(rec) = sorter.info.get(&to_mark) {
@@ -438,6 +468,24 @@ impl CoreScheduler {
                 for successor in successors {
                     sorter.ready.swap_remove(&successor);
                 }
+            }
+            expired
+        };
+        if cascade {
+            let canceled_names: Vec<String> = {
+                let interner = self.lock_interner();
+                expired
+                    .iter()
+                    .filter_map(|id| match interner.resolve(*id) {
+                        Item::Node(name) if !VIRTUAL_NODES.contains(&name.as_str()) => {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for name in canceled_names {
+                self.pending_canceled.push((epoch.clone(), name));
             }
         }
 
@@ -460,7 +508,14 @@ impl CoreScheduler {
                     Item::Signal(_, sig) => sig.clone(),
                     Item::Node(_) => continue,
                 };
-                self.expire_impl(epoch, node_id, Some(&signal_name), true, unlock_optionals)?;
+                self.expire_impl(
+                    epoch,
+                    node_id,
+                    Some(&signal_name),
+                    true,
+                    unlock_optionals,
+                    cascade,
+                )?;
             }
         }
 
@@ -548,7 +603,7 @@ impl CoreScheduler {
                 .collect();
             for node in exclusive {
                 let item = self.lock_interner().intern_node(&node);
-                sorter.mark_expired(&[item], true);
+                sorter.mark_expired(&[item], true, false);
             }
         }
         Ok(())
@@ -577,6 +632,179 @@ impl CoreScheduler {
             self.epoch_sorter(epoch)?,
             self.interner.clone(),
         ))
+    }
+
+    /// Port of `Scheduler._withheld`: stateful nodes run in strict epoch
+    /// order, both across root epochs and across sibling subepochs
+    fn withheld(&mut self, node: &str, epoch: &EpochKey) -> CoreResult<bool> {
+        let stateful = self
+            .nodes
+            .get(node)
+            .map(|f| f.is_stateful())
+            .unwrap_or(false);
+        if !stateful {
+            return Ok(false);
+        }
+        if self.stateful_watermark(node)? < root_int(epoch) {
+            return Ok(true);
+        }
+        if epoch.len() > 1 {
+            // sibling subepochs run in order too
+            let (chain, index) = epoch[epoch.len() - 1].clone();
+            let Some(parent_key) = parent(epoch) else {
+                return Ok(false);
+            };
+            let siblings: Vec<EpochKey> = self
+                .subepochs
+                .get(&parent_key)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            for sibling in siblings {
+                let (sib_chain, sib_index) = sibling[sibling.len() - 1].clone();
+                if sib_chain == chain
+                    && sib_index < index
+                    && self.epochs.contains_key(&sibling)
+                    && !self.node_complete_in_graph(node, &sibling)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Port of `Scheduler._stateful_watermark`: the lowest root epoch the node
+    /// has not yet completed. Monotonic, advanced lazily as epochs complete.
+    fn stateful_watermark(&mut self, node: &str) -> CoreResult<i64> {
+        let mut progress = *self.progress.get(node).unwrap_or(&0);
+        while self.root_complete(node, progress)? {
+            progress += 1;
+        }
+        self.progress.insert(node.to_owned(), progress);
+        Ok(progress)
+    }
+
+    /// Port of `Scheduler._root_complete`
+    fn root_complete(&mut self, node: &str, root: i64) -> CoreResult<bool> {
+        if self.epoch_log.contains(&root) {
+            return Ok(true);
+        }
+        let key: EpochKey = vec![("tube".to_owned(), root)];
+        if !self.epochs.contains_key(&key) {
+            return Ok(false);
+        }
+        self.node_complete_in(node, &key)
+    }
+
+    /// Port of `Scheduler._node_complete_in`: the node is done/expired in the
+    /// epoch and all of its subepochs, only counting graphs it is a member of
+    fn node_complete_in(&mut self, node: &str, epoch: &EpochKey) -> CoreResult<bool> {
+        if self.epoch_log.contains(&root_int(epoch)) {
+            return Ok(true);
+        }
+        if !self.epochs.contains_key(epoch) {
+            return Ok(false);
+        }
+        let mut keys: Vec<EpochKey> = vec![epoch.clone()];
+        if let Some(subs) = self.subepochs.get(epoch) {
+            keys.extend(subs.iter().cloned());
+        }
+        for key in keys {
+            if self.epochs.contains_key(&key) && !self.node_complete_in_graph(node, &key)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Port of `Scheduler._node_complete_in_graph`
+    fn node_complete_in_graph(&mut self, node: &str, epoch: &EpochKey) -> CoreResult<bool> {
+        let node_id = self.lock_interner().intern_node(node);
+        let sorter_arc = self.epoch_sorter(epoch)?;
+        let sorter = sorter_arc.lock().expect("sorter lock");
+        Ok(!sorter.info.contains_key(&node_id) || sorter.done.contains(&node_id))
+    }
+
+    /// All root epoch keys, in epoch order
+    fn root_keys(&self) -> Vec<EpochKey> {
+        let mut roots: Vec<EpochKey> = self
+            .epochs
+            .keys()
+            .filter(|k| k.len() == 1)
+            .cloned()
+            .collect();
+        roots.sort_by_key(root_int);
+        roots
+    }
+
+    /// Port of the epoch-creation arm of `Scheduler.iter_events`:
+    /// build graphs for granted epochs and, in freerun, the next epoch
+    /// once everything else has completed
+    fn create_runnable_epochs(&mut self, node_id: Option<&str>) -> CoreResult<()> {
+        for granted in self.run_queue.clone() {
+            if self.epoch_log.contains(&granted) {
+                self.run_queue.retain(|g| *g != granted);
+                continue;
+            }
+            let key: EpochKey = vec![("tube".to_owned(), granted)];
+            if !self.epochs.contains_key(&key) {
+                match self.add_epoch_impl(Some(key)) {
+                    Ok(_) | Err(CoreError::EpochExists(_)) | Err(CoreError::EpochCompleted(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        if self.freerun {
+            let exhausted = match node_id {
+                None => !self.is_active_impl(None)?,
+                Some(node) => {
+                    let keys: Vec<EpochKey> = self.epochs.keys().cloned().collect();
+                    let mut all_done = true;
+                    for key in keys {
+                        if !self.node_complete_in_graph(node, &key)? {
+                            all_done = false;
+                            break;
+                        }
+                    }
+                    all_done
+                }
+            };
+            if exhausted {
+                let mut next = self.grant_clock;
+                self.grant_clock += 1;
+                while self.epoch_log.contains(&next) {
+                    next = self.grant_clock;
+                    self.grant_clock += 1;
+                }
+                match self.add_epoch_impl(Some(vec![("tube".to_owned(), next)])) {
+                    Ok(_) | Err(CoreError::EpochExists(_)) | Err(CoreError::EpochCompleted(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of `Scheduler.epoch_completed` without python conversion
+    fn epoch_completed_impl(&self, epoch: &EpochKey) -> CoreResult<bool> {
+        let in_log = epoch.len() == 1 && self.epoch_log.contains(&root_int(epoch));
+        let lt_min_log = self
+            .epoch_log
+            .iter()
+            .min()
+            .map(|min| root_int(epoch) <= *min)
+            .unwrap_or(false);
+        let previously_completed = !self.epoch_log.is_empty()
+            && !self.epochs.contains_key(epoch)
+            && (in_log || lt_min_log);
+
+        let active_completed = if self.epochs.contains_key(epoch) {
+            !self.is_active_impl(Some(epoch))?
+        } else {
+            false
+        };
+        Ok(previously_completed || active_completed)
     }
 
     /// Run a fresh full-graph sorter to exhaustion, port of `generations`
@@ -634,6 +862,12 @@ impl CoreScheduler {
             subgraphs: HashMap::new(),
             frozen: HashMap::new(),
             logger: logger.map(|l| l.unbind()),
+            freerun: false,
+            run_queue: Vec::new(),
+            grant_clock: 0,
+            progress: HashMap::new(),
+            pending_canceled: Vec::new(),
+            iter_pending_end: HashMap::new(),
         };
 
         // port of `_get_sources`
@@ -753,14 +987,23 @@ impl CoreScheduler {
         let ready_events = PyList::empty(py);
         for key in keys {
             let sorter_arc = self.epoch_sorter(&key)?;
-            let mut sorter = sorter_arc.lock().expect("sorter lock");
-            let interner = self.lock_interner();
-            for id in sorter.get_ready(filter_id) {
-                match interner.resolve(id).clone() {
+            let candidates: Vec<u32> = {
+                let sorter = sorter_arc.lock().expect("sorter lock");
+                match filter_id {
+                    None => sorter.ready.iter().copied().collect(),
+                    Some(f) => sorter.ready.iter().copied().filter(|n| *n == f).collect(),
+                }
+            };
+            for id in candidates {
+                let item = self.lock_interner().resolve(id).clone();
+                match item {
                     signal @ Item::Signal(..) => {
                         // signals should never be yielded as ready -
                         // expire and warn
-                        sorter.mark_expired(&[id], true);
+                        sorter_arc
+                            .lock()
+                            .expect("sorter lock")
+                            .mark_expired(&[id], true, false);
                         if let Some(logger) = &self.logger {
                             logger.bind(py).call_method1(
                                 "warning",
@@ -773,8 +1016,15 @@ impl CoreScheduler {
                         }
                     }
                     Item::Node(n) => {
+                        if self.withheld(&n, &key)? {
+                            // stateful nodes run in strict epoch order:
+                            // leave the node ready, to be returned once
+                            // earlier epochs complete
+                            continue;
+                        }
+                        sorter_arc.lock().expect("sorter lock").mark_out(&[id]);
                         let enabled = VIRTUAL_NODES.contains(&n.as_str())
-                            || self.nodes.get(&n).copied().unwrap_or(true);
+                            || self.nodes.get(&n).map(|f| f.enabled).unwrap_or(true);
                         if enabled {
                             ready_events.append(node_ready_event(py, &key, &n)?)?;
                         }
@@ -940,7 +1190,14 @@ impl CoreScheduler {
             }
 
             let ended = if rec.is_noevent {
-                self.expire_impl(&rec.epoch, &rec.node_id, Some(&rec.signal), true, true)?
+                self.expire_impl(
+                    &rec.epoch,
+                    &rec.node_id,
+                    Some(&rec.signal),
+                    true,
+                    true,
+                    true,
+                )?
             } else {
                 self.done_impl(&rec.epoch, &rec.node_id, Some(&rec.signal), true)?
             };
@@ -950,6 +1207,9 @@ impl CoreScheduler {
         }
 
         let result = PyList::new(py, recs.iter().map(|r| r.event.clone()))?;
+        for (epoch, node) in std::mem::take(&mut self.pending_canceled) {
+            result.append(node_canceled_event(py, &epoch, &node)?)?;
+        }
         for ended in &end_epochs {
             result.append(epoch_ended_event(py, ended)?)?;
         }
@@ -975,7 +1235,8 @@ impl CoreScheduler {
 
     /// Mark a node expired; returns an `EpochEnded` MetaEvent if that
     /// completed the epoch
-    #[pyo3(signature = (epoch, node_id, signal=None, with_signals=true, unlock_optionals=true))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (epoch, node_id, signal=None, with_signals=true, unlock_optionals=true, cascade=true))]
     fn expire<'py>(
         &mut self,
         py: Python<'py>,
@@ -984,6 +1245,7 @@ impl CoreScheduler {
         signal: Option<String>,
         with_signals: bool,
         unlock_optionals: bool,
+        cascade: bool,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let ended = self.expire_impl(
             &epoch,
@@ -991,6 +1253,7 @@ impl CoreScheduler {
             signal.as_deref(),
             with_signals,
             unlock_optionals,
+            cascade,
         )?;
         match ended {
             Some(ended) => Ok(Some(epoch_ended_event(py, &ended)?)),
@@ -1051,13 +1314,27 @@ impl CoreScheduler {
     }
 
     fn enable_node(&mut self, node_id: String) {
-        self.nodes.insert(node_id, true);
+        let stateful = self.nodes.get(&node_id).and_then(|f| f.stateful);
+        self.nodes.insert(
+            node_id,
+            NodeFlags {
+                enabled: true,
+                stateful,
+            },
+        );
         self.frozen.clear();
         self.subgraphs.clear();
     }
 
     fn disable_node(&mut self, node_id: String) {
-        self.nodes.insert(node_id.clone(), false);
+        let stateful = self.nodes.get(&node_id).and_then(|f| f.stateful);
+        self.nodes.insert(
+            node_id.clone(),
+            NodeFlags {
+                enabled: false,
+                stateful,
+            },
+        );
         self.frozen.clear();
         self.subgraphs.clear();
         let item = self.lock_interner().intern_node(&node_id);
@@ -1065,13 +1342,150 @@ impl CoreScheduler {
             sorter
                 .lock()
                 .expect("sorter lock")
-                .mark_expired(&[item], true);
+                .mark_expired(&[item], true, false);
         }
     }
 
     fn clear(&mut self) {
         self.epochs.clear();
         self.epoch_log.clear();
+        self.freerun = false;
+        self.run_queue.clear();
+        self.grant_clock = 0;
+        self.progress.clear();
+        self.pending_canceled.clear();
+        self.iter_pending_end.clear();
+    }
+
+    // ------ run control & iteration ------
+
+    /// Grant permission to run a specific (root) epoch (a `process` call)
+    fn queue_epoch(&mut self, epoch: EpochArg) -> PyResult<Ep> {
+        let key = epoch.into_key();
+        let root = root_int(&key);
+        if !self.run_queue.contains(&root) && !self.epoch_log.contains(&root) {
+            self.run_queue.push(root);
+        }
+        if self.grant_clock <= root {
+            self.grant_clock = root + 1;
+        }
+        Ok(Ep(key))
+    }
+
+    /// Grant permission to run the next `n` epochs (a bounded `start` call)
+    fn queue_epochs(&mut self, n: usize) -> Vec<Ep> {
+        let mut granted = Vec::with_capacity(n);
+        for _ in 0..n {
+            let i = self.grant_clock;
+            self.grant_clock += 1;
+            if !self.run_queue.contains(&i) {
+                self.run_queue.push(i);
+            }
+            granted.push(Ep(vec![("tube".to_owned(), i)]));
+        }
+        granted
+    }
+
+    /// Grant (or revoke) permission to run any epoch as soon as it is ready
+    /// (an unbounded `start` , or a `stop` )
+    fn set_freerun(&mut self, enabled: bool) {
+        self.freerun = enabled;
+    }
+
+    /// One step of `Scheduler.iter_events`: returns the next batch of
+    /// MetaEvents (`EpochEnded` endings, or a batch of `NodeReady` events
+    /// from a single epoch). An empty list means no progress can be made
+    /// until the scheduler is updated or granted more run permission -
+    /// the python wrapper yields `None` for it.
+    #[pyo3(signature = (node_id=None))]
+    fn next_events<'py>(
+        &mut self,
+        py: Python<'py>,
+        node_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        self.create_runnable_epochs(node_id.as_deref())?;
+
+        let mut pending_end = self.iter_pending_end.remove(&node_id).unwrap_or_default();
+
+        // epoch lifecycle, before serving more work: when iterating for a
+        // single node, the rest of the graph is not locally observable,
+        // so end epochs once the node completes in them
+        if let Some(node) = node_id.as_deref() {
+            for epoch in self.root_keys() {
+                if self.node_complete_in(node, &epoch)? && !self.epoch_completed_impl(&epoch)? {
+                    self.end_epoch_impl(Some(epoch.clone()))?;
+                    pending_end.insert(epoch);
+                }
+            }
+            let mut ended: Vec<EpochKey> = pending_end
+                .iter()
+                .filter(|e| self.epoch_completed_impl(e).unwrap_or(false))
+                .cloned()
+                .collect();
+            if !ended.is_empty() {
+                ended.sort_by_key(root_int);
+                let out = PyList::empty(py);
+                for epoch in ended {
+                    pending_end.swap_remove(&epoch);
+                    out.append(epoch_ended_event(py, &epoch)?)?;
+                }
+                self.iter_pending_end.insert(node_id, pending_end);
+                return Ok(out);
+            }
+        }
+
+        // serve one batch from granted epochs in grant order,
+        // falling back to anything ready when freerunning.
+        // an incomplete granted epoch blocks later grants -
+        // cancellation completes epochs that can never run.
+        // stateful nodes run in epoch order, so their grants are served
+        // sorted; stateless nodes honor the order permission was granted.
+        let stateful = node_id
+            .as_deref()
+            .and_then(|n| self.nodes.get(n))
+            .map(|f| f.is_stateful())
+            .unwrap_or(false);
+        let mut grant_order = self.run_queue.clone();
+        if node_id.is_none() || stateful {
+            grant_order.sort_unstable();
+        }
+        let mut batch: Option<(EpochKey, Bound<'py, PyList>)> = None;
+        for granted in grant_order {
+            let key: EpochKey = vec![("tube".to_owned(), granted)];
+            if !self.epochs.contains_key(&key) {
+                continue;
+            }
+            let ready = self.get_ready(py, Some(key.clone()), node_id.clone())?;
+            if !ready.is_empty() {
+                batch = Some((key, ready));
+                break;
+            }
+            if let Some(node) = node_id.as_deref() {
+                if !self.node_complete_in(node, &key)? {
+                    // blocked waiting for this grant's inputs
+                    break;
+                }
+            }
+        }
+        if batch.is_none() && self.freerun {
+            for key in self.root_keys() {
+                let ready = self.get_ready(py, Some(key.clone()), node_id.clone())?;
+                if !ready.is_empty() {
+                    batch = Some((key, ready));
+                    break;
+                }
+            }
+        }
+
+        let out = match batch {
+            Some((epoch, ready)) => {
+                pending_end.insert(epoch);
+                ready
+            }
+            None => PyList::empty(py),
+        };
+        self.iter_pending_end.insert(node_id, pending_end);
+        Ok(out)
     }
 
     fn has_cycle(&mut self) -> PyResult<bool> {

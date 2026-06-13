@@ -1,16 +1,17 @@
 from datetime import UTC, datetime
 from multiprocessing import Queue
 from queue import Empty
+from uuid import uuid4
 
 import pytest
 
 from noob import NodeSpecification, SynchronousRunner, Tube
 from noob.edge import Edge
-from noob.event import Event, MetaEventType
+from noob.event import Event, MetaEventType, MetaSignal
 from noob.exceptions import EpochCompletedError
 from noob.scheduler import Scheduler
 from noob.toposort import TopoSorter
-from noob.types import Epoch
+from noob.types import Epoch, NodeSignal
 
 
 def test_epoch_increment():
@@ -447,3 +448,229 @@ def test_non_equivalent_event(non_equivalent_event):
         },
     )
     scheduler.update([non_equivalent_event])
+
+
+# --------------------------------------------------
+# statefulness, cancellation, run control & iteration
+# --------------------------------------------------
+
+
+def _event(node_id: str, signal: str, epoch: int | Epoch, value=1) -> Event:
+    return Event(
+        id=uuid4().int,
+        timestamp=datetime.now(UTC),
+        node_id=node_id,
+        signal=signal,
+        epoch=Epoch(epoch) if isinstance(epoch, int) else epoch,
+        value=value,
+    )
+
+
+def _node_scheduler(stateful: bool) -> Scheduler:
+    """
+    A scheduler as the zmq NodeRunner holds one: a single node's spec,
+    plus the edges of the graph around it
+    """
+    return Scheduler(
+        nodes={
+            "b": NodeSpecification(
+                id="b",
+                type="noob.testing.multiply",
+                stateful=stateful,
+                depends=[{"left": "a.value"}],
+            )
+        },
+        edges=[
+            Edge(source_node="a", source_signal="value", target_node="b", target_slot="left")
+        ],
+    )
+
+
+def test_scheduler_reads_edge_and_node_fields():
+    """
+    Drift canary for the fields the rust core extracts across the barrier
+    (``EdgeRec``: source_node, source_signal, required;
+    ``NodeFlags``: enabled, stateful) and the python scheduler's equivalent
+    reads. Renaming a python field/key breaks one of these assertions before
+    it can silently change scheduling behavior.
+    """
+    scheduler = Scheduler(
+        nodes={
+            "a": NodeSpecification(id="a", type="noob.testing.notreal"),
+            "b": NodeSpecification(id="b", type="noob.testing.notreal"),
+            "c": NodeSpecification(
+                id="c",
+                type="noob.testing.notreal",
+                depends=[{"left": "a.value"}, {"right": "b.value"}],
+            ),
+            "off": NodeSpecification(id="off", type="noob.testing.notreal", enabled=False),
+            "s": NodeSpecification(
+                id="s",
+                type="noob.testing.notreal",
+                stateful=True,
+                depends=[{"left": "a.value"}],
+            ),
+        },
+        edges=[
+            Edge(source_node="a", source_signal="value", target_node="c", target_slot="left"),
+            Edge(
+                source_node="b",
+                source_signal="value",
+                target_node="c",
+                target_slot="right",
+                required=False,
+            ),
+            Edge(source_node="a", source_signal="value", target_node="s", target_slot="left"),
+        ],
+    )
+
+    # EdgeRec.source_node / source_signal -> graph_signals
+    assert ("a", "value") in scheduler.graph_signals
+    assert ("b", "value") in scheduler.graph_signals
+
+    epoch = scheduler.add_epoch()
+
+    # EdgeRec.required -> the required edge is a hard predecessor, the optional one isn't
+    optional = scheduler[epoch].node_info["c"].optional_predecessors
+    assert NodeSignal("b", "value") in optional
+    assert NodeSignal("a", "value") not in optional
+
+    # NodeFlags.enabled=False -> disabled node never becomes ready
+    ready_values = {r["value"] for r in scheduler.get_ready(epoch)}
+    assert "a" in ready_values
+    assert "off" not in ready_values
+
+    # NodeFlags.stateful=True -> withheld in a later epoch until earlier ones complete
+    scheduler.add_epoch(1)
+    scheduler.update([_event("a", "value", 1)])
+    assert scheduler.get_ready(Epoch(1), node_id="s") == []
+
+
+def test_iter_epoch():
+    """
+    iter_epoch yields ready nodes for a single epoch in dependency order,
+    and ends when the epoch completes
+    """
+    tube = Tube.from_specification("testing-basic")
+    scheduler = tube.scheduler
+    epoch = scheduler.add_epoch()
+
+    ran = []
+    for item in scheduler.iter_epoch():
+        assert item is not None, "nothing should stall when nodes complete synchronously"
+        ran.append(item["value"])
+        scheduler.done(epoch=item["epoch"], node_id=item["value"])
+
+    assert not scheduler.is_active(epoch)
+    assert scheduler.epoch_completed(epoch)
+    assert ran.index("a") < ran.index("b")
+
+
+def test_get_ready_withholds_stateful():
+    """
+    Stateful nodes are only ready in an epoch once they have completed
+    all earlier epochs; stateless nodes run in any epoch as soon as
+    their inputs are satisfied.
+    """
+    stateful = _node_scheduler(True)
+    stateless = _node_scheduler(False)
+    for scheduler in (stateful, stateless):
+        scheduler.add_epoch(0)
+        scheduler.add_epoch(1)
+        # the node's input arrives in epoch 1 before epoch 0
+        scheduler.update([_event("a", "value", 1)])
+
+    # stateless: run wherever ready
+    ready = stateless.get_ready(node_id="b")
+    assert [r["epoch"] for r in ready] == [Epoch(1)]
+
+    # stateful: withheld until epoch 0 completes
+    assert stateful.get_ready(node_id="b") == []
+    stateful.update([_event("a", "value", 0)])
+    ready = stateful.get_ready(node_id="b")
+    assert [r["epoch"] for r in ready] == [Epoch(0)]
+    stateful.done(Epoch(0), "b")
+    ready = stateful.get_ready(node_id="b")
+    assert [r["epoch"] for r in ready] == [Epoch(1)]
+
+
+def test_update_emits_node_canceled():
+    """
+    A NoEvent expires everything that requires it for the rest of the epoch:
+    update returns NodeCanceled MetaEvents for the canceled nodes
+    and the epoch can complete.
+    """
+    scheduler = _node_scheduler(False)
+    epoch = scheduler.add_epoch()
+
+    events = scheduler.update([_event("a", "value", 0, value=MetaSignal.NoEvent)])
+
+    canceled = [
+        e
+        for e in events
+        if e["node_id"] == "meta" and e["signal"] == MetaEventType.NodeCanceled
+    ]
+    assert [(c["value"], c["epoch"]) for c in canceled] == [("b", Epoch(0))]
+    assert scheduler.node_is_done("b", epoch)
+    assert not scheduler.is_active(epoch)
+
+
+@pytest.mark.parametrize("stateful", [True, False])
+def test_iter_events_grants(stateful):
+    """
+    iter_events runs granted epochs: stateful nodes wait for strict epoch
+    order even when grants arrive out of order, while stateless nodes run
+    granted epochs as soon as their inputs arrive.
+    """
+    scheduler = _node_scheduler(stateful)
+    items = scheduler.iter_events("b")
+
+    # no permission, nothing to do
+    assert next(items) is None
+
+    # epoch 1 granted and its inputs available, but 0 has not happened yet
+    scheduler.queue_epoch(Epoch(1))
+    scheduler.update([_event("a", "value", 1)])
+    item = next(items)
+
+    if stateful:
+        assert item is None
+        scheduler.queue_epoch(Epoch(0))
+        scheduler.update([_event("a", "value", 0)])
+        item = next(items)
+        assert item["signal"] == MetaEventType.NodeReady
+        assert item["epoch"] == Epoch(0)
+        scheduler.done(Epoch(0), "b")
+        # the epoch ends (we only observe our own node), then epoch 1 runs
+        item = next(items)
+        assert item["signal"] == MetaEventType.EpochEnded
+        assert item["epoch"] == Epoch(0)
+        item = next(items)
+
+    assert item["signal"] == MetaEventType.NodeReady
+    assert item["epoch"] == Epoch(1)
+
+
+def test_iter_events_freerun():
+    """
+    In freerun, iter_events creates new epochs as the node completes old ones
+    """
+    scheduler = Scheduler(
+        nodes={"a": NodeSpecification(id="a", type="noob.testing.count_source", stateful=True)},
+        edges=[Edge(source_node="a", source_signal="index", target_node="b", target_slot="left")],
+    )
+    items = scheduler.iter_events("a")
+    assert next(items) is None
+
+    scheduler.set_freerun(True)
+    for i in range(3):
+        item = next(items)
+        assert item["signal"] == MetaEventType.NodeReady
+        assert item["epoch"] == Epoch(i)
+        scheduler.done(Epoch(i), "a")
+        ended = next(items)
+        assert ended["signal"] == MetaEventType.EpochEnded
+        assert ended["epoch"] == Epoch(i)
+
+    scheduler.set_freerun(False)
+    assert next(items) is None

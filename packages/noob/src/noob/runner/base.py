@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar, overload
 from noob import Tube, init_logger
 from noob.asset import AssetScope
 from noob.edge import Edge
-from noob.event import Event, MetaEvent
+from noob.event import Event, MetaEvent, MetaEventType
 from noob.exceptions import InputMissingError
 from noob.input import InputScope
 from noob.node import Node, Return
@@ -108,11 +108,15 @@ class TubeRunner(ABC):
         with self._asset_context(AssetScope.process):
             self._before_process()
 
-            while self.tube.scheduler.is_active():
-                ready = self._get_ready()
-                ready = self._filter_ready(ready, self.tube.scheduler)
-                for node_info in ready:
-                    self._process_node(node_info=node_info, input=input)
+            for node_info in self.tube.scheduler.iter_epoch():
+                if node_info is None:
+                    # synchronous runner: nodes run to completion between items,
+                    # so when nothing is ready no further progress can be made
+                    break
+                if node_info["signal"] != MetaEventType.NodeReady:
+                    continue
+                for ready in self._filter_ready([node_info], self.tube.scheduler):
+                    self._process_node(node_info=ready, input=input)
 
             self._after_process()
             result = self.collect_return()
@@ -264,9 +268,6 @@ class TubeRunner(ABC):
         before collecting return values.
         """
         return
-
-    def _get_ready(self, epoch: Epoch | None = None) -> list[MetaEvent]:
-        return self.tube.scheduler.get_ready(epoch=epoch)
 
     def _filter_ready(self, nodes: list[MetaEvent], scheduler: Scheduler) -> list[MetaEvent]:
         """

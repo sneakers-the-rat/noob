@@ -28,14 +28,23 @@ All scheduler state and logic live in rust. Conversion happens once, at the
 boundary: the core accepts and returns real `noob` objects ( `Epoch` ,
 `NodeSignal` , `MetaEvent` dicts) and raises `noob.exceptions` types directly,
 constructing them through cached class references rather than calling back
-into python logic. The python wrappers
-(`noob.rust_scheduler.RustScheduler` / `RustTopoSorter`) are pure delegation,
-existing only to carry the `nodes` / `edges` python attributes and to subclass
-`TopoSorter` for `isinstance` compatibility.
+into python logic.
 
-When used standalone (without `noob` installed), `CoreTopoSorter` still works,
-returning plain tuples for `(node, signal)` items and raising its own
-exception types; the scheduler's event-facing APIs require `noob`.
+The package is a mixed rust/python layout: the compiled extension is the inner
+module `noob_core._core`, and `noob_core/__init__.py` re-exports it and adds
+the python adapters (`noob_core.RustScheduler` / `RustTopoSorter`). The
+adapters are near-pure delegation, existing only to carry the `nodes` /
+`edges` python attributes, to subclass `TopoSorter` for `isinstance`
+compatibility, and to provide the `iter_epoch` / `iter_events` generators.
+`noob.scheduler` imports `RustScheduler` from here when the package is
+installed.
+
+`noob-core` depends on `noob` and only works alongside it: the rust core and
+the adapters are both defined in terms of noob's domain types. (The inner
+`noob_core._core` extension's `CoreTopoSorter` can be exercised without `noob`
+loaded - returning plain tuples for `(node, signal)` items and raising its own
+exception types - but the package as a whole, and the scheduler's
+event-facing APIs, require `noob`.)
 
 ## Building
 

@@ -287,6 +287,11 @@ def switch() -> (
         yield MetaSignal.NoEvent, MetaSignal.NoEvent, next(minerals)
 
 
+def skip_odd(value: int) -> int | MetaSignal:
+    """Emit even values, NoEvent for odd ones"""
+    return value if value % 2 == 0 else MetaSignal.NoEvent
+
+
 def this_or_that(
     this: Any | None = None, that: Any | None = None, the_other: Any | None = None
 ) -> dict:

@@ -6,17 +6,60 @@
 
 **Added**
 
+- [`#144`](https://github.com/miniscope/noob/issues/144),
+  [`#140`](https://github.com/miniscope/noob/issues/140) -
+  Scheduling policy moved out of the runners and into the graph model of the
+  scheduler and topological sorter (implemented in both the python scheduler
+  and the rust core):
+
+  - *Cancellation is graph behavior:* `TopoSorter.mark_expired(cascade=True)`
+    transitively expires everything that requires an item that expired without
+    running, so a `NoEvent` cancels the rest of the epoch downstream of it
+    instead of leaving nodes in limbo. `Scheduler.update` returns
+    `NodeCanceled` MetaEvents (a new `MetaEventType`) for the canceled nodes.
+    The zmq `NodeRunner` reacts by publishing NoEvents for its own signals, so
+    cancellation propagates hop-by-hop along the same edges as data - fixing
+    node runners waiting forever on epochs canceled by a `NoEvent` emitted
+    several hops upstream (which they don't subscribe to).
+  - *Statefulness is scheduler state:* node statefulness is resolved onto
+    `NodeSpecification` when nodes are instantiated, and `Scheduler.get_ready`
+    withholds stateful nodes from epochs (and sibling subepochs) until they
+    have completed all earlier ones - the `expected_epoch` bookkeeping in the
+    zmq `NodeRunner` is gone, and the async runner no longer runs stateful
+    nodes out of order across subepochs.
+  - *Run control:* `Scheduler.queue_epoch` / `queue_epochs` / `set_freerun`
+    grant permission to run epochs (`process` / bounded `start` / freerun),
+    replacing the todo-queues, counters, and flags previously duplicated
+    across runners.
+  - *Two iterators drive all runners:*
+    `Scheduler.iter_epoch(epoch=None, node_id=None)` yields scheduling events
+    for a single epoch until it completes (the synchronous and asyncio
+    runners' `process`), and `Scheduler.iter_events(node_id=None)` yields
+    events until stopped, running granted epochs and managing epoch lifecycle
+    from a single node's point of view (the zmq `NodeRunner` loop, replacing
+    `await_node` and most of `await_inputs`).
 - `noob-core` - an optional rust implementation of the scheduler and topo sorter
   (`packages/noob-core`, pyO3 bindings).
   When installed, `noob.scheduler.Scheduler` *is* the rust-backed
-  `noob.rust_scheduler.RustScheduler`, a drop-in replacement for the public
+  `noob_core.RustScheduler`, a drop-in replacement for the public
   scheduler API - no code changes needed. The pure-python scheduler remains in
   place and is used when `noob-core` is not installed,
   or when `NOOB_SCHEDULER=python` is set.
   The rust `CoreScheduler` owns one `CoreTopoSorter` per epoch; all scheduler
   logic runs in rust, and `Epoch`/`NodeSignal`/`MetaEvent` objects are
-  constructed at the barrier, so the python classes are pure delegation.
+  constructed at the barrier, so the python adapters are pure delegation.
+  `noob-core` is a mixed rust/python package: the compiled extension is the
+  inner module `noob_core._core`, and the `noob_core` package adds the
+  `RustScheduler` / `RustTopoSorter` adapters, so the rust-backed scheduler
+  lives entirely in `noob-core` (it depends on `noob` for the domain types).
   ~3x faster epoch scheduling on medium-sized (hundreds of nodes) graphs.
+
+**Changed**
+
+- NoEvent-valued events are no longer stored by the zmq runners' event stores:
+  they are scheduling information, not collectible values
+  (downstream collectors like the `Return` node now see an absence
+  rather than a `NoEvent` value).
 
 ### v1000.1.0 - 26-05-18
 

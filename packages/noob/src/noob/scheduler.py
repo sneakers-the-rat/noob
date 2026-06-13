@@ -2,15 +2,16 @@ import contextlib
 import logging
 import os
 from collections import defaultdict, deque
-from collections.abc import MutableSequence
+from collections.abc import Iterator, MutableSequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import cached_property
 from itertools import count
-from typing import Self
+from typing import Any, Self
 from uuid import uuid4
 
+from noob.const import VIRTUAL_NODES as _VIRTUAL_NODES
 from noob.edge import Edge
 from noob.event import Event, MetaEvent, MetaEventType, MetaSignal
 from noob.exceptions import AlreadyDoneError, EpochCompletedError, EpochExistsError, NotAddedError
@@ -18,13 +19,6 @@ from noob.logging import init_logger
 from noob.node import NodeSpecification
 from noob.toposort import GraphItem, NodeSignal, TopoSorter
 from noob.types import Epoch, NodeID, SignalName
-
-_VIRTUAL_NODES = ("input", "assets")
-"""
-Virtual nodes that don't actually exist as nodes,
-but can be depended on 
-(and can be present or absent, and so shouldn't be marked as trivially done)
-"""
 
 
 @dataclass()
@@ -42,6 +36,19 @@ class Scheduler:
         default_factory=dict
     )
     _frozen_sorters: dict[tuple[NodeID, ...], TopoSorter] = field(default_factory=dict)
+
+    _freerun: bool = False
+    """Permission to run any epoch as soon as it is ready, creating epochs as needed"""
+    _run_queue: list[int] = field(default_factory=list)
+    """Root epochs we have permission to run, in the order permission was granted"""
+    _grant_clock: count = field(default_factory=count)
+    """The next epoch number to grant for implicit (`start n`/freerun) run permission"""
+    _progress: dict[NodeID, int] = field(default_factory=dict)
+    """Per-node stateful watermark: the lowest root epoch the node has not yet completed.
+    Stateful nodes are only ready in an epoch when their watermark has reached it."""
+    _pending_meta: list[MetaEvent] = field(default_factory=list)
+    """MetaEvents generated as side effects (e.g. NodeCanceled from expiry cascades),
+    drained and returned by :meth:`.update`"""
 
     def __post_init__(self):
         self._get_sources()
@@ -146,9 +153,16 @@ class Scheduler:
         for parent in epoch.parents:
             self._subepochs[parent].add(epoch)
 
-        # a node inducing subepochs expires the node in the (immediate) parent epoch
+        # a node inducing subepochs expires the node in the (immediate) parent epoch.
+        # this is bookkeeping, not cancellation: the node's work continues in the subepochs
         if epoch[-1].node_id not in parent_epoch.done_nodes:
-            self.expire(epoch.parent, epoch[-1].node_id, with_signals=False, unlock_optionals=False)
+            self.expire(
+                epoch.parent,
+                epoch[-1].node_id,
+                with_signals=False,
+                unlock_optionals=False,
+                cascade=False,
+            )
 
         return epoch
 
@@ -191,7 +205,11 @@ class Scheduler:
 
         ready_nodes = []
         for epoch, graph in graphs:
-            for node in graph.get_ready(node_id):
+            if node_id is None:
+                candidates = tuple(graph.ready_nodes)
+            else:
+                candidates = tuple(node for node in graph.ready_nodes if node == node_id)
+            for node in candidates:
                 if isinstance(node, NodeSignal):
                     self._logger.warning(
                         "Scheduler attempted to return signal tuple %s in %s - "
@@ -204,7 +222,12 @@ class Scheduler:
                     )
                     graph.mark_expired(node)
                     continue
-                elif node in _VIRTUAL_NODES or (node not in self.nodes or self.nodes[node].enabled):
+                if self._withheld(node, epoch):
+                    # stateful nodes run in strict epoch order:
+                    # leave the node ready, to be returned once earlier epochs complete
+                    continue
+                graph.mark_out(node)
+                if node in _VIRTUAL_NODES or (node not in self.nodes or self.nodes[node].enabled):
                     ready_nodes.append(
                         MetaEvent(
                             id=uuid4().int,
@@ -249,6 +272,283 @@ class Scheduler:
             return all(node in self._epochs[e].done_nodes for e in self._subepochs[epoch] | {epoch})
         else:
             return node in self._epochs[epoch].done_nodes
+
+    # --------------------------------------------------
+    # statefulness - stateful nodes run in strict epoch order
+    # --------------------------------------------------
+
+    def _withheld(self, node: NodeID, epoch: Epoch) -> bool:
+        """
+        Whether a node that is ready in the sorter graph should be withheld from running:
+        stateful nodes run in strict epoch order,
+        both across root epochs and across sibling subepochs.
+        """
+        spec = self.nodes.get(node)
+        if spec is None or not spec.stateful:
+            return False
+        if self._stateful_watermark(node) < epoch.root[0].epoch:
+            return True
+        if len(epoch) > 1:
+            # sibling subepochs run in order too
+            chain, index = epoch[-1].node_id, epoch[-1].epoch
+            parent = epoch.parent
+            for sibling in self._subepochs.get(parent, ()):  # type: ignore[arg-type]
+                if (
+                    sibling[-1].node_id == chain
+                    and sibling[-1].epoch < index
+                    and sibling in self._epochs
+                    and not self._node_complete_in_graph(node, sibling)
+                ):
+                    return True
+        return False
+
+    def _stateful_watermark(self, node: NodeID) -> int:
+        """
+        The lowest root epoch the node has not yet completed:
+        all root epochs below the watermark are complete for the node.
+        Monotonic, advanced lazily as epochs complete.
+        """
+        progress = self._progress.get(node, 0)
+        while self._root_complete(node, progress):
+            progress += 1
+        self._progress[node] = progress
+        return progress
+
+    def _root_complete(self, node: NodeID, root: int) -> bool:
+        """The node is done/expired in the given root epoch and all of its subepochs"""
+        if root in self._epoch_log:
+            return True
+        epoch = Epoch(root)
+        if epoch not in self._epochs:
+            return False
+        return self._node_complete_in(node, epoch)
+
+    def _node_complete_in(self, node: NodeID, epoch: Epoch) -> bool:
+        """
+        The node is done/expired in the given epoch and all of its subepochs,
+        only counting graphs the node is a member of
+        (subepoch subgraphs may not contain the node at all).
+        """
+        if epoch.root[0].epoch in self._epoch_log:
+            return True
+        if epoch not in self._epochs:
+            return False
+        for e in (epoch, *self._subepochs.get(epoch, ())):  # type: ignore[arg-type]
+            if e in self._epochs and not self._node_complete_in_graph(node, e):
+                return False
+        return True
+
+    def _node_complete_in_graph(self, node: NodeID, epoch: Epoch) -> bool:
+        graph = self._epochs[epoch]
+        return node not in graph.node_info or node in graph.done_nodes
+
+    # --------------------------------------------------
+    # cancellation metaevents
+    # --------------------------------------------------
+
+    def _record_canceled(self, epoch: Epoch, expired: tuple[GraphItem, ...]) -> None:
+        """
+        Record ``NodeCanceled`` MetaEvents for nodes expired by a cancellation cascade,
+        to be returned from :meth:`.update` alongside the events that caused them.
+        """
+        for item in expired:
+            if isinstance(item, NodeSignal) or item in _VIRTUAL_NODES:
+                continue
+            self._pending_meta.append(self._meta(MetaEventType.NodeCanceled, epoch, item))
+
+    def _drain_meta(self) -> list[MetaEvent]:
+        pending = self._pending_meta
+        self._pending_meta = []
+        return pending
+
+    @staticmethod
+    def _meta(signal: MetaEventType, epoch: Epoch, value: Any) -> MetaEvent:
+        return MetaEvent(
+            id=uuid4().int,
+            timestamp=datetime.now(UTC),
+            node_id="meta",
+            signal=signal,
+            epoch=epoch,
+            value=value,
+        )
+
+    # --------------------------------------------------
+    # run control & iteration
+    # --------------------------------------------------
+
+    def queue_epoch(self, epoch: Epoch | int) -> Epoch:
+        """
+        Grant permission to run a specific (root) epoch,
+        i.e. when receiving a ``process`` call for that epoch.
+        """
+        if isinstance(epoch, int):
+            epoch = Epoch(epoch)
+        root = epoch.root[0].epoch
+        if root not in self._run_queue and root not in self._epoch_log:
+            self._run_queue.append(root)
+        self._grant_clock = count(max(next(self._grant_clock), root + 1))
+        return epoch
+
+    def queue_epochs(self, n: int) -> list[Epoch]:
+        """
+        Grant permission to run the next ``n`` epochs,
+        i.e. when receiving a bounded ``start(n)`` call.
+        """
+        granted = []
+        for _ in range(n):
+            i = next(self._grant_clock)
+            if i not in self._run_queue:
+                self._run_queue.append(i)
+            granted.append(Epoch(i))
+        return granted
+
+    def set_freerun(self, enabled: bool) -> None:
+        """
+        Grant (or revoke) permission to run any epoch as soon as its inputs are
+        available, creating new epochs as previous ones complete -
+        i.e. when receiving an unbounded ``start`` (or a ``stop`` ).
+        """
+        self._freerun = enabled
+
+    def iter_epoch(
+        self, epoch: Epoch | int | None = None, node_id: NodeID | None = None
+    ) -> Iterator[MetaEvent | None]:
+        """
+        Iterate scheduling events for a single epoch, until the epoch is no longer active.
+
+        Yields ``NodeReady`` :class:`.MetaEvent` s as nodes become ready to run,
+        and ``None`` when no more progress can be made until the scheduler is
+        updated - concurrent callers should wait for an update
+        (in whatever way is appropriate for them) and resume iterating.
+
+        Args:
+            epoch (Epoch | int | None): The epoch to iterate. If ``None`` ,
+                the most recently created root epoch.
+            node_id (str | None): If present, only yield events for the given node.
+        """
+        if epoch is None:
+            roots = [e for e in self._epochs if len(e) == 1]
+            if not roots:
+                return
+            epoch = max(roots, key=lambda e: e[0].epoch)
+        elif isinstance(epoch, int):
+            epoch = Epoch(epoch)
+
+        while self.is_active(epoch):
+            batch = self.get_ready(epoch, node_id)
+            if batch:
+                yield from batch
+            else:
+                yield None
+
+    def iter_events(self, node_id: NodeID | None = None) -> Iterator[MetaEvent | None]:
+        """
+        Iterate scheduling events until stopped.
+
+        Runs epochs as granted by :meth:`.queue_epoch` , :meth:`.queue_epochs` ,
+        and :meth:`.set_freerun` , creating their graphs as needed
+        (in freerun mode, new epochs are created as previous ones complete).
+        Granted epochs are served in the order permission was granted;
+        stateful nodes additionally run in strict epoch order (see :meth:`.get_ready` ).
+
+        Yields ``NodeReady`` and ``EpochEnded`` :class:`.MetaEvent` s, and ``None``
+        when no more progress can be made until the scheduler is updated or granted
+        more run permission - callers should wait and resume iterating.
+        The iterator never ends: stopping is the caller's decision
+        (e.g. on a ``stop`` command, or by closing the generator).
+
+        When iterating for a single node (the zmq runner case, where each node
+        runner sees only the events of its direct upstream), epochs are ended
+        once the node has completed in them - the rest of the graph is not
+        observable, so the epoch's lifetime locally is the node's participation.
+
+        Args:
+            node_id (str | None): If present, only yield events for the given node,
+                and manage epoch lifecycle from that node's point of view.
+        """
+        pending_end: set[Epoch] = set()
+        while True:
+            # create graphs for granted epochs so that source nodes become ready
+            for granted in list(self._run_queue):
+                if granted in self._epoch_log:
+                    with contextlib.suppress(ValueError):
+                        self._run_queue.remove(granted)
+                    continue
+                if Epoch(granted) not in self._epochs:
+                    with contextlib.suppress(EpochExistsError, EpochCompletedError):
+                        self.add_epoch(granted)
+
+            # in freerun, create the next epoch once everything else has completed
+            if self._freerun:
+                if node_id is None:
+                    exhausted = not self.is_active()
+                else:
+                    exhausted = all(
+                        self._node_complete_in_graph(node_id, e) for e in list(self._epochs)
+                    )
+                if exhausted:
+                    nxt = next(self._grant_clock)
+                    while nxt in self._epoch_log:
+                        nxt = next(self._grant_clock)
+                    with contextlib.suppress(EpochExistsError, EpochCompletedError):
+                        self.add_epoch(nxt)
+
+            # epoch lifecycle, before serving more work:
+            # when iterating for a single node, the rest of the graph is not
+            # locally observable, so end epochs once the node completes in them
+            if node_id is not None:
+                ended = False
+                for epoch in [e for e in self._epochs if len(e) == 1]:
+                    if self._node_complete_in(node_id, epoch) and not self.epoch_completed(epoch):
+                        self.end_epoch(epoch)
+                        pending_end.add(epoch)
+                for epoch in sorted(pending_end, key=lambda e: e[0].epoch):
+                    if self.epoch_completed(epoch):
+                        pending_end.discard(epoch)
+                        ended = True
+                        yield self._meta(MetaEventType.EpochEnded, epoch, epoch)
+                if ended:
+                    # re-derive state: the caller may have reacted to the endings
+                    continue
+
+            # serve one batch from granted epochs in grant order,
+            # falling back to anything ready when freerunning.
+            # an incomplete granted epoch blocks later grants -
+            # cancellation (NodeCanceled) completes epochs that can never run.
+            # stateful nodes run in epoch order, so their grants are served sorted;
+            # stateless nodes honor the order permission was granted.
+            spec = self.nodes.get(node_id) if node_id is not None else None
+            stateful = spec is not None and bool(spec.stateful)
+            grant_order = (
+                sorted(self._run_queue) if node_id is None or stateful else list(self._run_queue)
+            )
+            batch: list[MetaEvent] = []
+            batch_epoch: Epoch | None = None
+            for granted in grant_order:
+                target = Epoch(granted)
+                if target not in self._epochs:
+                    continue
+                batch = self.get_ready(target, node_id)
+                if batch:
+                    batch_epoch = target
+                    break
+                if node_id is not None and not self._node_complete_in(node_id, target):
+                    # blocked waiting for this grant's inputs
+                    break
+            if not batch and self._freerun:
+                roots = sorted((e for e in self._epochs if len(e) == 1), key=lambda e: e[0].epoch)
+                for epoch in roots:
+                    batch = self.get_ready(epoch, node_id)
+                    if batch:
+                        batch_epoch = epoch
+                        break
+
+            if batch and batch_epoch is not None:
+                pending_end.add(batch_epoch)
+                yield from batch
+                continue
+
+            yield None
 
     def __getitem__(self, epoch: Epoch | int) -> TopoSorter:
         if epoch == -1:
@@ -322,7 +622,7 @@ class Scheduler:
             if epoch_ended:
                 end_events.append(epoch_ended)
 
-        ret_events = [*events, *end_events]
+        ret_events = [*events, *self._drain_meta(), *end_events]
 
         return ret_events
 
@@ -372,13 +672,27 @@ class Scheduler:
         signal: SignalName | None = None,
         with_signals: bool = True,
         unlock_optionals: bool = True,
+        cascade: bool = True,
     ) -> MetaEvent | None:
         """
         Mark a node as having been completed without making its dependent nodes ready.
         i.e. when the node emitted ``NoEvent``
+
+        Args:
+            cascade (bool): If ``True`` (default), transitively expire nodes that can
+                never run because their required predecessors expired without running -
+                a ``NoEvent`` cancels everything downstream for the epoch.
+                ``NodeCanceled`` MetaEvents are emitted for the canceled nodes
+                (returned from :meth:`.update` ).
+                Use ``False`` for bookkeeping expirations
+                (e.g. when forking subepochs), where downstream nodes run elsewhere.
         """
         to_mark = NodeSignal(node_id, signal) if signal is not None else node_id
-        self[epoch].mark_expired(to_mark, unlock_optionals=unlock_optionals)
+        expired = self[epoch].mark_expired(
+            to_mark, unlock_optionals=unlock_optionals, cascade=cascade
+        )
+        if cascade:
+            self._record_canceled(epoch, expired)
         # if any immediate successors are already marked as "ready," we also want to cancel them.
         if info := self[epoch].node_info.get(to_mark):
             for successor in info.successors:
@@ -386,7 +700,11 @@ class Scheduler:
         if signal is None and with_signals:
             for graph_node in self[epoch].signals[node_id]:
                 self.expire(
-                    epoch, node_id=node_id, signal=graph_node[1], unlock_optionals=unlock_optionals
+                    epoch,
+                    node_id=node_id,
+                    signal=graph_node[1],
+                    unlock_optionals=unlock_optionals,
+                    cascade=cascade,
                 )
 
         if not self.is_active(epoch):
@@ -457,10 +775,15 @@ class Scheduler:
 
     def clear(self) -> None:
         """
-        Remove epoch records, restarting the scheduler
+        Remove epoch records and run state, restarting the scheduler
         """
         self._epochs = {}
         self._epoch_log = deque(maxlen=100)
+        self._freerun = False
+        self._run_queue = []
+        self._grant_clock = count()
+        self._progress = {}
+        self._pending_meta = []
 
     def _init_graph(self, epoch: Epoch | None = None) -> TopoSorter:
         """
@@ -616,4 +939,4 @@ if os.environ.get("NOOB_SCHEDULER", "").lower() not in ("python", "py"):
     # use the optimized rust scheduler when the optional noob-core package
     # is installed. set NOOB_SCHEDULER=python to force the pure-python one.
     with contextlib.suppress(ImportError):
-        from noob.rust_scheduler import RustScheduler as Scheduler  # noqa: F811
+        from noob_core import RustScheduler as Scheduler  # noqa: F811

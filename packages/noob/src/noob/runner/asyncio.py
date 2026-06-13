@@ -5,7 +5,7 @@ from functools import partial
 from typing import Any
 
 from noob.asset import AssetScope
-from noob.event import MetaEvent
+from noob.event import MetaEvent, MetaEventType
 from noob.exceptions import InputMissingError
 from noob.input import InputScope
 from noob.node import Node, Return
@@ -19,12 +19,10 @@ class AsyncRunner(TubeRunner):
     """
     Run nodes in an asyncio eventloop as soon as they are ready.
 
-    .. important::
-
-        The AsyncIO runner respects stateful nodes across top-level epochs,
-        but currently runs subepochs induced by a `map` operation out of order!
-        Either make your nodes stateless or use another runner until total ordering is implemented!
-
+    Statefulness is respected by the scheduler
+    ( :meth:`.Scheduler.get_ready` , consumed via :meth:`.Scheduler.iter_epoch` ):
+    a stateful node is not yielded as ready in an epoch (or subepoch)
+    until it has completed in all earlier epochs that contain it.
     """
 
     eventloop: asyncio.AbstractEventLoop = field(default_factory=asyncio.get_running_loop)
@@ -70,12 +68,25 @@ class AsyncRunner(TubeRunner):
         with self._asset_context(AssetScope.process):
             await self._before_process()
 
+            epoch_done = object()
+            ready_items = self.tube.scheduler.iter_epoch()
             while self.tube.scheduler.is_active():
-                ready = await self._get_ready()
-                ready = self._filter_ready(ready, self.tube.scheduler)
-                for node_info in ready:
+                if self._exception:
+                    await self._raise_exception()
+                async with self._scheduler_lock:
+                    node_info = next(ready_items, epoch_done)
+                if node_info is epoch_done:
+                    break
+                if node_info is None:
+                    # nothing ready: wait until a running node completes and check again
+                    self._node_ready.clear()
+                    await self._node_ready.wait()
+                    continue
+                if node_info["signal"] != MetaEventType.NodeReady:
+                    continue
+                for ready in self._filter_ready([node_info], self.tube.scheduler):
                     await self._task_sem.acquire()
-                    self._process_node(node_info=node_info, input=input)
+                    self._process_node(node_info=ready, input=input)
 
             self._after_process()
             result = self.collect_return()
@@ -160,20 +171,6 @@ class AsyncRunner(TubeRunner):
         self.store.clear()
         async with self._scheduler_lock:
             self.tube.scheduler.add_epoch()
-
-    async def _get_ready(self, epoch: Epoch | None = None) -> list[MetaEvent]:  # type: ignore[override]
-        if self._exception:
-            await self._raise_exception()
-        async with self._scheduler_lock:
-            ready = self.tube.scheduler.get_ready()
-        if not ready:
-            # if none are ready, wait until another node is complete and check again
-            self._node_ready.clear()
-            await self._node_ready.wait()
-            async with self._scheduler_lock:
-                return self.tube.scheduler.get_ready()
-        else:
-            return ready
 
     def _call_node(self, node: Node, *args: Any, **kwargs: Any) -> Any:
         future: asyncio.Task | asyncio.Future

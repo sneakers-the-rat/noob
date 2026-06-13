@@ -64,6 +64,14 @@ class MetaEventType(StrEnum):
     """
     An epoch has ended, the value of the event contains which epoch has ended
     """
+    NodeCanceled = "NodeCanceled"
+    """
+    A node will never run in a given epoch -
+    e.g. because an upstream node emitted ``NoEvent`` ,
+    so the node's required inputs can never be satisfied.
+    The value of the event is the node_id of the canceled node,
+    and the epoch is the epoch it was canceled in.
+    """
 
 
 class MetaEvent(Event):

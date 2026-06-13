@@ -6,7 +6,7 @@ use pyo3::types::{PyDict, PySet, PyTuple};
 
 use crate::bridge::Bridge;
 use crate::item::{Interner, Item};
-use crate::sorter::{extract_nodes, EdgeRec, Sorter};
+use crate::sorter::{extract_nodes, EdgeRec, NodeFlags, Sorter};
 
 /// Shared handle to a [`Sorter`] and the [`Interner`] that resolves its item
 /// ids. Locks are uncontended in practice (everything runs under the GIL);
@@ -60,7 +60,7 @@ impl CoreTopoSorter {
     #[new]
     #[pyo3(signature = (nodes=None, edges=None))]
     fn new(nodes: Option<Bound<'_, PyDict>>, edges: Option<Vec<EdgeRec>>) -> PyResult<Self> {
-        let nodes: IndexMap<String, bool> = match &nodes {
+        let nodes: IndexMap<String, NodeFlags> = match &nodes {
             Some(nodes) => extract_nodes(nodes)?,
             None => IndexMap::new(),
         };
@@ -118,11 +118,18 @@ impl CoreTopoSorter {
         sorter.mark_out(&ids);
     }
 
-    #[pyo3(signature = (nodes, unlock_optionals=true))]
-    fn mark_expired(&self, nodes: Vec<Item>, unlock_optionals: bool) {
+    #[pyo3(signature = (nodes, unlock_optionals=true, cascade=false))]
+    fn mark_expired<'py>(
+        &self,
+        py: Python<'py>,
+        nodes: Vec<Item>,
+        unlock_optionals: bool,
+        cascade: bool,
+    ) -> PyResult<Bound<'py, PyTuple>> {
         let (mut sorter, mut interner) = self.lock();
         let ids: Vec<u32> = nodes.into_iter().map(|i| interner.intern(i)).collect();
-        sorter.mark_expired(&ids, unlock_optionals);
+        let expired = sorter.mark_expired(&ids, unlock_optionals, cascade);
+        PyTuple::new(py, expired.iter().map(|id| interner.resolve(*id).clone()))
     }
 
     fn resurrect(&self, nodes: Vec<Item>) -> PyResult<()> {

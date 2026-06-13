@@ -6,11 +6,9 @@ import os
 import signal
 import traceback
 import uuid
-from collections import deque
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from functools import cached_property, partial
-from itertools import count
 from types import FrameType
 from typing import Any, cast
 
@@ -21,7 +19,7 @@ from noob import init_logger
 from noob.asset import AssetScope, AssetSpecification
 from noob.config import config
 from noob.edge import Edge, Signal
-from noob.event import Event, MetaEvent
+from noob.event import Event, MetaEventType, MetaSignal
 from noob.exceptions import AlreadyDoneError, EpochCompletedError
 from noob.input import InputCollection
 from noob.network.loop import EventloopMixin
@@ -136,10 +134,6 @@ class NodeRunner(EventloopMixin):
         self._depends: tuple[tuple[str, str], ...] | None = None
         self._has_input: bool | None = None
         self._nodes: dict[str, IdentifyValue] = {}
-        self._counter = count()
-        self._epochs_todo: deque[Epoch] = deque()
-        self._freerun = asyncio.Event()
-        self._process_one = asyncio.Event()
         self._status: NodeStatus = NodeStatus.stopped
         self._status_lock = asyncio.Lock()
         self._ready_condition = asyncio.Condition()
@@ -283,8 +277,6 @@ class NodeRunner(EventloopMixin):
             signal.signal(signal.SIGTERM, _handler)
             await self.init()
             self._node = cast(Node, self._node)
-            self._freerun.clear()
-            self._process_one.clear()
             await asyncio.gather(self._poll_receivers(), self._process_loop())
         except KeyboardInterrupt:
             self.logger.debug("Got keyboard interrupt, quitting")
@@ -310,8 +302,6 @@ class NodeRunner(EventloopMixin):
                     value = await loop.run_in_executor(executor, part)
                 events = self.store.add_value(self._node.signals, value, self._node.id, epoch)
                 async with self._ready_condition:
-                    self.scheduler.add_epoch()
-
                     # nodes don't report epoch endings since they don't know about the full tube
                     events = [e for e in events if e["node_id"] != "meta"]
                     if events:
@@ -321,94 +311,80 @@ class NodeRunner(EventloopMixin):
 
     async def await_inputs(self) -> AsyncGenerator[tuple[tuple[Any], dict[str, Any], Epoch]]:
         """
-        Iterate inputs as they are ready
+        Iterate inputs as they are ready.
 
-        Handle multiple types of running
-        - `process` based: run a single epoch, or set of epochs at a time
-        - free`run` based: run until told to stop
+        All scheduling policy lives in the scheduler's event iterator
+        ( :meth:`.Scheduler.iter_events` ): epoch ordering for stateful
+        nodes, run permission from ``process`` / ``start`` commands, and
+        freerun epoch inference. Here we only do the i/o on its decisions:
 
-        And multiple types of nodes
-        - stateful: must call epochs and subepochs in order
-        - stateless: call whichever epoch whenever the dependencies are met
+        - ``NodeReady`` : collect inputs and yield them to the process loop
+        - ``EpochEnded`` : clear the event store and process-scoped assets
+
+        (Cancellation - ``NodeCanceled`` - is handled in :meth:`.on_event` ,
+        where it is returned from :meth:`.Scheduler.update` .)
         """
         self._node = cast(Node, self._node)
-        epoch = None
-        # FIXME: This handling of statefulness is shamefully awful and if you see this
-        # YELL AT JONNY TO FIX IT.
-        # This logic should all be consolidated into the scheduler, see issue #144
-        expected_epoch = Epoch(0) if self._node.stateful else None
+        ready_items = self.scheduler.iter_events(self.spec.id)
         while not self._quitting.is_set():
-            if (
-                not self._freerun.is_set()
-                and epoch is None
-                and (
-                    len(self._epochs_todo) == 0
-                    or (
-                        len(self._epochs_todo) > 0
-                        and self._node.stateful
-                        and self._epochs_todo[0] != expected_epoch
-                    )
-                )
-            ):
-                self._process_one.clear()
-                await self._process_one.wait()
-                if (
-                    len(self._epochs_todo) > 0
-                    and self._node.stateful
-                    and self._epochs_todo[0] != expected_epoch
-                ):
-                    continue
+            async with self._ready_condition:
+                item = next(ready_items)
+                while item is None:
+                    await self._ready_condition.wait()
+                    item = next(ready_items)
 
-            # if we don't have a current epoch that we're working on...
-            if epoch is None:
-                if len(self._epochs_todo) > 0:
-                    # given to us explicitly by a `process` call
-                    epoch = self._epochs_todo.popleft()
-                else:
-                    # infer while freerunning
-                    epoch = Epoch(next(self._counter)) if self._node.stateful else None
-                epoch = cast(Epoch, epoch)
-                if self._node.stateful:
-                    expected_epoch = Epoch(epoch[0].epoch + 1)
-
-            readies = await self.await_node(epoch=epoch)
-
-            if epoch is None:
-                # stateless nodes - run the given epoch to completion
-                epoch = list(dict.fromkeys([r["epoch"].root for r in readies]))[0]
-                self._counter = count(max(next(self._counter), epoch.root[0].epoch + 1))
-
-            for ready in readies:
-                edges = self._node.edges
-
-                inputs = self.store.collect(
-                    edges, ready["epoch"], eventmap=self._node.injections.get("events")
-                )
-                if inputs is None:
-                    inputs = {}
-
-                self.state.init(AssetScope.node, self._node.edges)
-                self.state.init(AssetScope.process, self._node.edges)
-                assets = self.state.collect(self._node.edges)
-                inputs |= assets if assets else {}
-
-                if self._node.injections.get("epoch"):
-                    inputs[self._node.injections["epoch"]] = ready["epoch"]
-
-                args, kwargs = self.store.split_args_kwargs(inputs)
-                yield args, kwargs, ready["epoch"]
-                self.state.deinit(AssetScope.node, self._node.edges)
-
-            if self.scheduler.node_is_done(
-                self.spec.id, epoch
-            ) and not self.scheduler.epoch_completed(epoch):
-                self.scheduler.end_epoch(epoch)
-
-            if self.scheduler.epoch_completed(epoch):
-                self.logger.debug("Epoch completed: %s", epoch)
+            if item["signal"] == MetaEventType.EpochEnded:
+                self.logger.debug("Epoch completed: %s", item["epoch"])
                 self.state.deinit(AssetScope.process, self._node.edges)
-                self.store.clear(epoch)
-                epoch = None
+                self.store.clear(item["epoch"])
+                continue
+
+            epoch = item["epoch"]
+            inputs = self.store.collect(
+                self._node.edges, epoch, eventmap=self._node.injections.get("events")
+            )
+            if inputs is None:
+                inputs = {}
+
+            self.state.init(AssetScope.node, self._node.edges)
+            self.state.init(AssetScope.process, self._node.edges)
+            assets = self.state.collect(self._node.edges)
+            inputs |= assets if assets else {}
+
+            if self._node.injections.get("epoch"):
+                inputs[self._node.injections["epoch"]] = epoch
+
+            args, kwargs = self.store.split_args_kwargs(inputs)
+            yield args, kwargs, epoch
+            self.state.deinit(AssetScope.node, self._node.edges)
+
+    async def _publish_cancellation(self, epoch: Epoch) -> None:
+        """
+        We will never run in this epoch - an upstream node emitted ``NoEvent``
+        and our required inputs can never be satisfied.
+        Emit NoEvents for all our signals as if we had run and emitted nothing,
+        so that cancellation propagates along the same edges as data:
+        our subscribers don't subscribe to the node that originally emitted
+        the NoEvent, only to us.
+        """
+        self._node = cast(Node, self._node)
+        signals = self._node.signals or {}
+        events = [
+            Event(
+                id=uuid.uuid4().int,
+                timestamp=datetime.now(UTC),
+                node_id=self.spec.id,
+                signal=signal,
+                epoch=epoch,
+                value=MetaSignal.NoEvent,
+            )
+            for signal in signals
+        ]
+        if not events:
+            return
+        self.logger.debug("Canceled in epoch %s, publishing NoEvents", epoch)
+        msg = EventMsg(node_id=self.spec.id, value=events)
+        await self.sockets["outbox"].send_multipart([b"event", msg.to_bytes()])
 
     async def publish_events(self, events: list[Event], epoch: Epoch) -> None:
         # re-emit any events that we initialized or received:
@@ -632,29 +608,41 @@ class NodeRunner(EventloopMixin):
 
         to_update = [e for e in events if e["node_id"] != "assets"]
         for event in events:
-            if event["node_id"] == "meta":
+            # NoEvents are scheduling information, not collectible values
+            if event["node_id"] == "meta" or event["value"] is MetaSignal.NoEvent:
                 continue
             event = cast(Event, event)
             self.store.add(event)
 
+        canceled: list[Epoch] = []
         async with self._ready_condition:
             # we might have already been told the epoch was completed,
             # so this information is redundant.
             with contextlib.suppress(EpochCompletedError):
-                self.scheduler.update(to_update)
+                updated = self.scheduler.update(to_update)
+                canceled = [
+                    e["epoch"]
+                    for e in updated
+                    if e["node_id"] == "meta"
+                    and e["signal"] == MetaEventType.NodeCanceled
+                    and e["value"] == self.spec.id
+                ]
             self._handle_assets(msg)
             self._ready_condition.notify_all()
+        for epoch in canceled:
+            await self._publish_cancellation(epoch)
 
     async def on_start(self, msg: StartMsg) -> None:
         """
         Start running in free mode
         """
         await self.update_status(NodeStatus.running)
-        if msg.value is None:
-            self._freerun.set()
-        else:
-            self._epochs_todo.extend(Epoch(next(self._counter)) for _ in range(msg.value))
-        self._process_one.set()
+        async with self._ready_condition:
+            if msg.value is None:
+                self.scheduler.set_freerun(True)
+            else:
+                self.scheduler.queue_epochs(msg.value)
+            self._ready_condition.notify_all()
 
     async def on_process(self, msg: ProcessMsg) -> None:
         """
@@ -662,10 +650,9 @@ class NodeRunner(EventloopMixin):
         """
         self._node = cast(Node, self._node)
         self.logger.debug("Received Process message: %s", msg)
-        self._epochs_todo.append(msg.value["epoch"])
-        if self._node.stateful:
-            self._epochs_todo = deque(sorted(self._epochs_todo))
-        self._counter = count(max(next(self._counter), msg.value["epoch"].root[0].epoch + 1))
+        async with self._ready_condition:
+            self.scheduler.queue_epoch(msg.value["epoch"])
+            self._ready_condition.notify_all()
         if self.has_input and self.depends:  # for mypy - depends is always true if has_input is
             # combine with any tube-scoped input and store as events
             # when calling the node, we get inputs from the eventstore rather than input collection
@@ -691,12 +678,11 @@ class NodeRunner(EventloopMixin):
                 self._ready_condition.notify_all()
                 self.logger.debug("Updated scheduler with process events: %s", scheduler_events)
 
-        self._process_one.set()
-
     async def on_stop(self, msg: StopMsg) -> None:
         """Stop processing (but stay responsive)"""
-        self._process_one.clear()
-        self._freerun.clear()
+        async with self._ready_condition:
+            self.scheduler.set_freerun(False)
+            self._ready_condition.notify_all()
         await self.update_status(NodeStatus.stopped)
         self.logger.debug("Stopped")
 
@@ -752,50 +738,6 @@ class NodeRunner(EventloopMixin):
                 async with self._ready_condition:
                     self.scheduler.done(epoch=msg.value + 1, node_id="assets")
                     self._ready_condition.notify_all()
-
-    async def await_node(self, epoch: Epoch | None = None) -> list[MetaEvent]:
-        """
-        Block until a node is ready
-
-        Args:
-            epoch (Epoch, None): if `int` , wait until the node is ready in the given epoch,
-                otherwise wait until the node is ready in any epoch
-
-        """
-        async with self._ready_condition:
-
-            def _wait_for() -> bool:
-                node_ready = self.scheduler.node_is_ready(self.spec.id, epoch)
-                node_done = (
-                    False if epoch is None else self.scheduler.node_is_done(self.spec.id, epoch)
-                )
-                return node_ready or node_done
-
-            await self._ready_condition.wait_for(_wait_for)
-
-            if epoch is not None and self.scheduler.node_is_done(self.spec.id, epoch):
-                return []
-
-            # be FIFO-like and get the earliest epoch the node is ready in
-            if epoch is None:
-                for ep, graph in self.scheduler._epochs.items():
-                    if self.spec.id in graph.ready_nodes:
-                        epoch = ep
-                        break
-
-            if epoch is None:
-                raise RuntimeError(
-                    "Could not find ready epoch even though node ready condition passed, "
-                    "something is wrong with the way node status checking is "
-                    "locked between threads."
-                )
-
-            # mark just one event as "out."
-            # threadsafe because we are holding the lock that protects graph mutation
-            ready = self.scheduler.get_ready(epoch, node_id=self.spec.id)
-            ready = [r for r in ready if r["value"] == self.spec.id]
-
-        return ready
 
     def _handle_assets(self, msg: EventMsg) -> None:
         """

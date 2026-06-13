@@ -1,0 +1,29 @@
+noob_id: testing-noevent-chain
+noob_model: noob.tube.TubeSpecification
+noob_version: 0.0.1
+description: |
+  A chain of nodes downstream of a node that emits NoEvent every other epoch.
+  The downstream nodes only subscribe to their direct dependency, so in the
+  zmq runner cancellation must propagate hop-by-hop for the epoch to complete.
+
+nodes:
+  count:
+    type: noob.testing.count_source
+    params:
+      start: 0
+  skip:
+    type: noob.testing.skip_odd
+    depends:
+      - value: count.index
+  double:
+    type: noob.testing.multiply
+    depends:
+      - left: skip.value
+  quadruple:
+    type: noob.testing.multiply
+    depends:
+      - left: double.value
+  return:
+    type: return
+    depends:
+      - result: quadruple.value

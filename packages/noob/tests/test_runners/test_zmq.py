@@ -387,7 +387,7 @@ async def test_noderunner_stores_clear():
         await runner.on_event(msg)
         events.append(msg)
 
-    runner._freerun.set()
+    runner.scheduler.set_freerun(True)
     assert len(runner.store.events) == 3
     iterator = runner.await_inputs()
     _, _, epoch = await anext(iterator)

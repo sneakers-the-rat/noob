@@ -3,7 +3,9 @@ from itertools import cycle
 import pytest
 
 from noob import Tube
+from noob.event import MetaSignal
 from noob.runner import TubeRunner
+from noob.utils import iscoroutinefunction_partial
 
 
 @pytest.mark.parametrize("loaded_tube", ["testing-basic"], indirect=True)
@@ -54,6 +56,31 @@ def test_branch_switching(loaded_tube: Tube, runner: TubeRunner):
         assert e in value
         assert value[e].endswith("!")
         assert value["this_or_that"][key] == value[e]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loaded_tube", ["testing-noevent-chain"], indirect=True)
+async def test_noevent_cancels_chain(loaded_tube: Tube, all_runners: TubeRunner):
+    """
+    A NoEvent cancels everything downstream of it for the rest of the epoch,
+    and the epoch still completes - including in the zmq runner, where nodes
+    several hops downstream don't subscribe to the NoEvent emitter and
+    cancellation must propagate hop-by-hop
+    (the canceled nodes emit NoEvents to their own subscribers).
+    """
+    runner = all_runners
+    results = []
+    for _ in range(6):
+        if iscoroutinefunction_partial(runner.process):
+            results.append(await runner.process())
+        else:
+            results.append(runner.process())
+
+    values = [r["result"] for r in results if r is not None and r is not MetaSignal.NoEvent]
+    skipped = [r for r in results if r is None or r is MetaSignal.NoEvent]
+    # count emits 0..5; odd values are skipped, even values are quadrupled
+    assert values == [0, 8, 16]
+    assert len(skipped) == 3
 
 
 @pytest.mark.parametrize("loaded_tube", ["testing-merge"], indirect=True)

@@ -8,8 +8,11 @@ use crate::errors::{CoreError, CoreResult};
 use crate::item::Interner;
 
 /// The fields of `noob.edge.Edge` the scheduler cares about.
-/// Extracted attribute-wise from `Edge` objects at the barrier.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Field names match `Edge`'s attributes, so the derived `FromPyObject`
+/// reads them attribute-wise (its default) - keep the names in sync with
+/// `noob.edge.Edge`.
+#[derive(Clone, Debug, PartialEq, FromPyObject)]
 pub struct EdgeRec {
     pub source_node: String,
     pub source_signal: String,
@@ -17,24 +20,31 @@ pub struct EdgeRec {
     pub required: bool,
 }
 
-impl<'py> FromPyObject<'py> for EdgeRec {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        Ok(EdgeRec {
-            source_node: ob.getattr("source_node")?.extract()?,
-            source_signal: ob.getattr("source_signal")?.extract()?,
-            target_node: ob.getattr("target_node")?.extract()?,
-            required: ob.getattr("required")?.extract()?,
-        })
+/// The fields of `noob.node.NodeSpecification` the scheduler cares about.
+///
+/// Read attribute-wise by the derived `FromPyObject` (field names match
+/// `NodeSpecification`). `stateful` is `bool | None` in python - `None`
+/// (unresolved) is treated as stateless, see [`NodeFlags::is_stateful`].
+/// `Node.from_specification` resolves it for real tubes.
+#[derive(Clone, Copy, Debug, PartialEq, FromPyObject)]
+pub struct NodeFlags {
+    pub enabled: bool,
+    pub stateful: Option<bool>,
+}
+
+impl NodeFlags {
+    /// Statefulness with the `None` (unresolved) default flattened to stateless
+    pub fn is_stateful(&self) -> bool {
+        self.stateful.unwrap_or(false)
     }
 }
 
-/// Extract `dict[str, NodeSpecification]` to a node id -> enabled map
-pub fn extract_nodes(nodes: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, bool>> {
-    let mut out: IndexMap<String, bool> = IndexMap::with_capacity(nodes.len());
-    for (node_id, spec) in nodes.iter() {
-        out.insert(node_id.extract()?, spec.getattr("enabled")?.extract()?);
-    }
-    Ok(out)
+/// Extract `dict[str, NodeSpecification]` to a node id -> flags map
+pub fn extract_nodes(nodes: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, NodeFlags>> {
+    nodes
+        .iter()
+        .map(|(node_id, spec)| PyResult::Ok((node_id.extract()?, spec.extract()?)))
+        .collect()
 }
 
 /// Port of `noob.toposort._NodeInfo`
@@ -73,13 +83,13 @@ impl Sorter {
     /// Port of `TopoSorter.__init__` from a node map and edge list
     pub fn from_graph(
         interner: &mut Interner,
-        nodes: &IndexMap<String, bool>,
+        nodes: &IndexMap<String, NodeFlags>,
         edges: &[EdgeRec],
     ) -> CoreResult<Sorter> {
         let mut sorter = Sorter::default();
         // filter on disabled rather than enabled nodes, see python impl
-        for (node_id, enabled) in nodes {
-            if !enabled {
+        for (node_id, flags) in nodes {
+            if !flags.enabled {
                 let id = interner.intern_node(node_id);
                 sorter.disabled.insert(id);
             }
@@ -93,8 +103,8 @@ impl Sorter {
             sorter.add(interner, target, &[pred], edge.required)?;
         }
         // add enabled nodes that have no edges
-        for (node_id, enabled) in nodes {
-            if *enabled {
+        for (node_id, flags) in nodes {
+            if flags.enabled {
                 let id = interner.intern_node(node_id);
                 if !sorter.info.contains_key(&id) {
                     sorter.add(interner, id, &[], true)?;
@@ -125,8 +135,8 @@ impl Sorter {
         self.npassedout += nodes.len() as i64;
     }
 
-    /// Port of `_expire_nodes`
-    fn expire_nodes(&mut self, nodes: &[u32]) {
+    /// Port of `_expire_nodes`: returns the newly expired items
+    fn expire_nodes(&mut self, nodes: &[u32]) -> Vec<u32> {
         let mut expired: IndexSet<u32> = IndexSet::new();
         for n in nodes {
             if !self.done.contains(n) {
@@ -145,14 +155,68 @@ impl Sorter {
             self.done.insert(*n);
         }
         self.nfinished += expired.len() as i64;
+        expired.into_iter().collect()
     }
 
-    /// Port of `mark_expired`
-    pub fn mark_expired(&mut self, nodes: &[u32], unlock_optionals: bool) {
-        self.expire_nodes(nodes);
-        if !unlock_optionals {
-            return;
+    /// Port of `mark_expired`: returns the newly expired items,
+    /// including any expired by cascading
+    pub fn mark_expired(
+        &mut self,
+        nodes: &[u32],
+        unlock_optionals: bool,
+        cascade: bool,
+    ) -> Vec<u32> {
+        let mut expired = self.expire_nodes(nodes);
+        if !cascade {
+            if unlock_optionals {
+                self.unlock_optionals(nodes);
+            }
+            return expired;
         }
+
+        // cancellation cascade: anything that requires an item that expired
+        // without running can itself never run.
+        // optional unlocking is *direct* in a cascade: the transitive
+        // optional_successors unlock assumes only one item per branch expires,
+        // while a cascade expires the entire chain - each direct optional
+        // predecessor decrements its dependents exactly once, when it expires.
+        if unlock_optionals {
+            let initial: Vec<u32> = expired.clone();
+            for item in initial {
+                self.unlock_direct_optionals(item);
+            }
+        }
+        let mut stack: Vec<u32> = expired.clone();
+        while let Some(item) = stack.pop() {
+            let Some(rec) = self.info.get(&item) else {
+                continue;
+            };
+            let successors: Vec<u32> = rec.successors.iter().copied().collect();
+            for successor in successors {
+                if self.done.contains(&successor) || self.out.contains(&successor) {
+                    continue;
+                }
+                if self.info[&successor].optional_predecessors.contains(&item) {
+                    // optional dependents can still run without us -
+                    // they were unblocked by unlock_direct_optionals instead
+                    continue;
+                }
+                let newly = self.expire_nodes(&[successor]);
+                if newly.is_empty() {
+                    continue;
+                }
+                if unlock_optionals {
+                    self.unlock_direct_optionals(successor);
+                }
+                expired.extend(newly.iter().copied());
+                stack.push(successor);
+            }
+        }
+        expired
+    }
+
+    /// Port of `_unlock_optionals` (transitive, non-cascading expiry only)
+    fn unlock_optionals(&mut self, nodes: &[u32]) {
         for node in nodes {
             // python uses _get_nodeinfo here, which creates missing entries
             let optional_successors: Vec<u32> = self
@@ -168,10 +232,34 @@ impl Sorter {
                 if nqueue == 0 && !self.done.contains(&successor) && !self.out.contains(&successor)
                 {
                     if self.disabled.contains(&successor) {
-                        self.mark_expired(&[successor], false);
+                        self.mark_expired(&[successor], false, false);
                     } else {
                         self.mark_ready(&[successor]);
                     }
+                }
+            }
+        }
+    }
+
+    /// Port of `_unlock_direct_optionals`: decrement immediate successors that
+    /// optionally depend on the expired item - their dependency's fate is decided
+    fn unlock_direct_optionals(&mut self, item: u32) {
+        let Some(rec) = self.info.get(&item) else {
+            return;
+        };
+        let successors: Vec<u32> = rec.successors.iter().copied().collect();
+        for successor in successors {
+            if !self.info[&successor].optional_predecessors.contains(&item) {
+                continue;
+            }
+            let rec = self.get_nodeinfo(successor);
+            rec.nqueue -= 1;
+            let nqueue = rec.nqueue;
+            if nqueue == 0 && !self.done.contains(&successor) && !self.out.contains(&successor) {
+                if self.disabled.contains(&successor) {
+                    self.mark_expired(&[successor], false, false);
+                } else {
+                    self.mark_ready(&[successor]);
                 }
             }
         }
@@ -435,7 +523,7 @@ impl Sorter {
                 self.mark_out(&[node]);
             }
 
-            self.expire_nodes(&[node]);
+            let _ = self.expire_nodes(&[node]);
 
             let successors: Vec<u32> = self.info[&node].successors.iter().copied().collect();
             for successor in successors {
@@ -447,7 +535,7 @@ impl Sorter {
                 let nqueue = rec.nqueue;
                 if nqueue == 0 {
                     if self.disabled.contains(&successor) {
-                        self.mark_expired(&[successor], true);
+                        self.mark_expired(&[successor], true, false);
                     } else {
                         self.mark_ready(&[successor]);
                     }

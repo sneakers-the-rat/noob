@@ -177,17 +177,24 @@ class Node(BaseModel):
 
         # check if function by checking if callable -
         # Node classes do not have __call__ defined and thus should not be callable
+        node: Node
         if inspect.isclass(obj):
             if issubclass(obj, Node):
-                return obj(id=spec.id, spec=spec, enabled=spec.enabled, **params, **kwargs)
+                node = obj(id=spec.id, spec=spec, enabled=spec.enabled, **params, **kwargs)
             else:
-                return WrapClassNode(
+                node = WrapClassNode(
                     id=spec.id, cls=obj, spec=spec, params=params, enabled=spec.enabled, **kwargs
                 )
         else:
-            return WrapFuncNode(
+            node = WrapFuncNode(
                 id=spec.id, fn=obj, spec=spec, params=params, enabled=spec.enabled, **kwargs
             )
+        # propagate the resolved statefulness back to the spec:
+        # it can come from node class defaults (including generator detection)
+        # that only the instantiated node knows about,
+        # and schedulers only see specifications.
+        spec.stateful = node.stateful
+        return node
 
     @property
     def signals(self) -> dict[str, Signal]:

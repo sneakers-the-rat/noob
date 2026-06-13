@@ -26,6 +26,8 @@ pub struct Bridge {
     pub node_ready: Py<PyAny>,
     /// noob.event.MetaEventType.EpochEnded
     pub epoch_ended: Py<PyAny>,
+    /// noob.event.MetaEventType.NodeCanceled
+    pub node_canceled: Py<PyAny>,
     /// noob.event.MetaSignal.NoEvent
     pub noevent: Py<PyAny>,
     /// datetime.datetime
@@ -56,6 +58,7 @@ impl Bridge {
                 node_info: toposort.getattr("_NodeInfo")?.unbind(),
                 node_ready: meta_event_type.getattr("NodeReady")?.unbind(),
                 epoch_ended: meta_event_type.getattr("EpochEnded")?.unbind(),
+                node_canceled: meta_event_type.getattr("NodeCanceled")?.unbind(),
                 noevent: event.getattr("MetaSignal")?.getattr("NoEvent")?.unbind(),
                 datetime: datetime.getattr("datetime")?.unbind(),
                 utc: datetime.getattr("timezone")?.getattr("utc")?.unbind(),
@@ -135,5 +138,21 @@ pub fn node_ready_event<'py>(
         epoch,
         node_id.into_pyobject(py)?.into_any(),
         false,
+    )
+}
+
+/// A `NodeCanceled` MetaEvent: value is the node id, timestamp is UTC-aware
+pub fn node_canceled_event<'py>(
+    py: Python<'py>,
+    epoch: &EpochKey,
+    node_id: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let bridge = Bridge::get(py)?;
+    meta_event(
+        py,
+        &bridge.node_canceled,
+        epoch,
+        node_id.into_pyobject(py)?.into_any(),
+        true,
     )
 }

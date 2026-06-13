@@ -172,7 +172,9 @@ class TopoSorter:
         self._out_nodes.update(nodes)
         self._npassedout += len(nodes)
 
-    def mark_expired(self, *nodes: GraphItem, unlock_optionals: bool = True) -> None:
+    def mark_expired(
+        self, *nodes: GraphItem, unlock_optionals: bool = True, cascade: bool = False
+    ) -> tuple[GraphItem, ...]:
         """
         Mark node(s) as having been completed without making its dependent nodes ready -
         used when a node emits ``NoEvent``
@@ -181,11 +183,68 @@ class TopoSorter:
             unlock_optionals (bool): If True, decrement the nqueue for downstream nodes with
                 optional dependencies.
                 Use False when e.g. forking subepochs where no downstream nodes should run
+            cascade (bool): If True, transitively expire items that can never run
+                because a required predecessor was expired without running.
+                Use True for "real" expirations - a node emitting ``NoEvent``
+                cancels everything downstream of it for the epoch -
+                and False for bookkeeping expirations
+                (e.g. forking subepochs, where downstream nodes run in the subepochs).
+
+        Returns:
+            tuple[GraphItem, ...]: the items that were newly expired,
+            including any expired by cascading.
         """
-        self._expire_nodes(*nodes)
-        if not unlock_optionals:
-            return
-        # decrement the nqueue on any downstream nodes with optional dependencies
+        expired = list(self._expire_nodes(*nodes))
+        if not cascade:
+            if unlock_optionals:
+                # match historical behavior: unlock for all requested nodes,
+                # even if they were already expired
+                self._unlock_optionals(*nodes)
+            return tuple(expired)
+
+        # cancellation cascade: anything that requires an item that expired
+        # without running can itself never run.
+        # optional unlocking is *direct* in a cascade: the transitive
+        # optional_successors unlock assumes only one item per branch expires
+        # (decrementing on behalf of the whole undecided chain),
+        # while a cascade expires the entire chain - each direct optional
+        # predecessor decrements its dependents exactly once, when it expires.
+        if unlock_optionals:
+            for item in expired:
+                self._unlock_direct_optionals(item)
+        stack = list(expired)
+        while stack:
+            item = stack.pop()
+            info = self._node2info.get(item)
+            if info is None:
+                continue
+            for successor in info.successors:
+                if successor in self._done_nodes or successor in self._out_nodes:
+                    continue
+                successor_info = self._node2info[successor]
+                if item in successor_info.optional_predecessors:
+                    # optional dependents can still run without us -
+                    # they were unblocked by _unlock_direct_optionals instead
+                    continue
+                newly = self._expire_nodes(successor)
+                if not newly:
+                    continue
+                if unlock_optionals:
+                    self._unlock_direct_optionals(successor)
+                expired.extend(newly)
+                stack.append(successor)
+        return tuple(expired)
+
+    def _unlock_optionals(self, *nodes: GraphItem) -> None:
+        """
+        Decrement the nqueue on any downstream nodes with optional dependencies
+        anywhere beneath the given (expired) nodes,
+        making them ready if their fate is now decided.
+
+        This decrements on behalf of the whole undecided chain between the
+        expired node and the optional dependent, and so is only correct for
+        non-cascading expiry, where the chain itself stays unexpired.
+        """
         for node in nodes:
             info = self._get_nodeinfo(node)
             for successor in info.optional_successors:
@@ -196,6 +255,25 @@ class TopoSorter:
                         self.mark_expired(successor, unlock_optionals=False)
                     else:
                         self.mark_ready(successor)
+
+    def _unlock_direct_optionals(self, item: GraphItem) -> None:
+        """
+        Decrement the nqueue of immediate successors that optionally depend on
+        the given (expired) item: their dependency's fate is now decided.
+        """
+        info = self._node2info.get(item)
+        if info is None:
+            return
+        for successor in info.successors:
+            successor_info = self._node2info[successor]
+            if item not in successor_info.optional_predecessors:
+                continue
+            successor_info.nqueue -= 1
+            if successor_info.nqueue == 0 and successor not in self.done_nodes | self.out_nodes:
+                if successor in self._disabled_nodes:
+                    self.mark_expired(successor, unlock_optionals=False)
+                else:
+                    self.mark_ready(successor)
 
     def add(self, node: GraphItem, *predecessors: GraphItem, required: bool = True) -> None:
         """
@@ -414,9 +492,12 @@ class TopoSorter:
             self._node2info[node] = result = _NodeInfo(node)
         return result
 
-    def _expire_nodes(self, *nodes: GraphItem) -> None:
+    def _expire_nodes(self, *nodes: GraphItem) -> set[GraphItem]:
         """
-        Mark nodes as having been completed, either via done or marked explicitly expired
+        Mark nodes as having been completed, either via done or marked explicitly expired.
+
+        Returns the set of nodes that were newly expired
+        (i.e. excluding those that were already done).
         """
         expired = set(nodes) - self._done_nodes
         for node in expired:
@@ -427,6 +508,7 @@ class TopoSorter:
                 self._npassedout += 1
         self._done_nodes.update(expired)
         self._nfinished += len(expired)
+        return expired
 
     def _update_optionals(
         self, node: GraphItem, predecessors: Sequence[GraphItem], required: bool

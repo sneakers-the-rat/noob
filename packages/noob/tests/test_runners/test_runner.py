@@ -1,6 +1,5 @@
-from unittest.mock import patch
-
 from noob import SynchronousRunner, Tube
+from noob.event import MetaEventType
 from noob.node import NodeSpecification
 from noob.tube import TubeSpecification
 
@@ -110,12 +109,20 @@ def test_synch_unready_end_epoch():
     tube = Tube.from_specification("testing-gather-n")
     runner = SynchronousRunner(tube)
 
-    n_iters = 5
-    with patch("noob.scheduler.Scheduler.end_epoch") as end_epoch:
-        for _ in runner.iter(n=n_iters):
-            pass
+    ended = []
 
-        assert end_epoch.call_count == n_iters * tube.nodes["b"].n
+    def _cb(event) -> None:
+        if event["node_id"] == "meta" and event["signal"] == MetaEventType.EpochEnded:
+            ended.append(event)
+
+    runner.add_callback(_cb)
+
+    n_iters = 5
+    for _ in runner.iter(n=n_iters):
+        pass
+
+    # every epoch ends exactly once, even those where the gather emits nothing
+    assert len(ended) == n_iters * tube.nodes["b"].n
 
 
 def test_max_iters_doesnt_apply_without_return():
